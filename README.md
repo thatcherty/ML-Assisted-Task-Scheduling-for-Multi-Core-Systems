@@ -1,1 +1,1 @@
-# ML-Assisted-Task-Scheduling-for-Multi-Core-Systems
+# ML Assisted Task Scheduling for Multi-Core Systems
