@@ -147,6 +147,188 @@ def print_metrics(procs: List[Process], core_configs: List[CoreConfig]):
     print("-" * 80)
     print(f"{'Average':<22}{sum_ta/n:<14.2f}{sum_wt/n:<12.2f}{sum_rt/n:<14.2f}")
 
+# ── Excel Export ───────────────────────────────────────────────────────────────
+
+EXCEL_FILE = "scheduler_results.xlsx"
+
+def export_to_excel(procs, core_configs, total_ticks):
+    if not EXCEL_AVAILABLE:
+        print("  [Excel export skipped: run 'pip install openpyxl' to enable]")
+        return
+
+    # Colours
+    HDR_FILL   = PatternFill("solid", start_color="1E3A5F")
+    AVG_FILL   = PatternFill("solid", start_color="2D6A4F")
+    ALT_FILL   = PatternFill("solid", start_color="0F1E2E")
+    WHITE      = Font(color="FFFFFF", bold=True, name="Arial", size=10)
+    NORMAL     = Font(color="DDEEFF", name="Arial", size=10)
+    GREEN_F    = Font(color="FFFFFF", bold=True, name="Arial", size=10)
+    THIN       = Side(style="thin", color="2A4A6A")
+    BORDER     = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    CENTER     = Alignment(horizontal="center", vertical="center")
+    LEFT       = Alignment(horizontal="left",   vertical="center")
+
+    # Load or create workbook
+    if os.path.exists(EXCEL_FILE):
+        wb = load_workbook(EXCEL_FILE)
+    else:
+        wb = Workbook()
+        # Remove default sheet
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+
+    # Build a unique sheet name: "Run 1", "Run 2", ...
+    existing = [s for s in wb.sheetnames if s.startswith("Run ")]
+    run_num  = len(existing) + 1
+    sheet_name = f"Run {run_num}"
+    ws = wb.create_sheet(sheet_name)
+
+    # ── Summary block ─────────────────────────────────────────────────────────
+    combo = "  |  ".join(f"C{i}:{core_configs[i].label}" for i in range(NUM_CORES))
+    ws["A1"] = f"Run {run_num}  –  {combo}"
+    ws["A1"].font = Font(color="FFFFFF", bold=True, name="Arial", size=12)
+    ws["A1"].fill = PatternFill("solid", start_color="0A1628")
+    ws["A1"].alignment = LEFT
+    ws.merge_cells("A1:H1")
+
+    ws["A2"] = f"Total ticks: {total_ticks}    |    Processes: {len(procs)}"
+    ws["A2"].font = Font(color="88AACC", name="Arial", size=9)
+    ws["A2"].fill = PatternFill("solid", start_color="0A1628")
+    ws["A2"].alignment = LEFT
+    ws.merge_cells("A2:H2")
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = ["Process", "Core", "Algorithm", "Arrival", "Burst",
+               "Finish", "Turnaround", "Waiting", "Response"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=4, column=col, value=h)
+        cell.font      = WHITE
+        cell.fill      = HDR_FILL
+        cell.alignment = CENTER
+        cell.border    = BORDER
+
+    # ── Per-process rows ──────────────────────────────────────────────────────
+    for row_idx, p in enumerate(procs, 5):
+        ta = p.finish_time - p.arrival
+        wt = ta - p.burst
+        rt = p.first_run - p.arrival
+        fill = PatternFill("solid", start_color="0F1E2E") if row_idx % 2 == 0                else PatternFill("solid", start_color="122030")
+        row_data = [
+            f"P{p.name}",
+            f"Core {p.assigned_core}",
+            core_configs[p.assigned_core].label,
+            p.arrival,
+            p.burst,
+            p.finish_time,
+            ta,
+            wt,
+            rt,
+        ]
+        for col, val in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell.font      = NORMAL
+            cell.fill      = fill
+            cell.alignment = CENTER
+            cell.border    = BORDER
+
+    # ── Averages row ──────────────────────────────────────────────────────────
+    avg_row = 5 + len(procs)
+    n       = len(procs)
+    ta_vals = [p.finish_time - p.arrival           for p in procs]
+    wt_vals = [p.finish_time - p.arrival - p.burst for p in procs]
+    rt_vals = [p.first_run   - p.arrival            for p in procs]
+
+    avg_data = ["AVERAGE", "", "", "", "",
+                "",
+                f"=AVERAGE(G5:G{avg_row-1})",
+                f"=AVERAGE(H5:H{avg_row-1})",
+                f"=AVERAGE(I5:I{avg_row-1})"]
+    for col, val in enumerate(avg_data, 1):
+        cell = ws.cell(row=avg_row, column=col, value=val)
+        cell.font      = GREEN_F
+        cell.fill      = AVG_FILL
+        cell.alignment = CENTER
+        cell.border    = BORDER
+
+    # ── Per-core summary block ────────────────────────────────────────────────
+    summary_row = avg_row + 2
+    ws.cell(row=summary_row, column=1, value="Per-Core Summary").font =         Font(color="FFFFFF", bold=True, name="Arial", size=10)
+    ws.cell(row=summary_row, column=1).fill = HDR_FILL
+    ws.merge_cells(f"A{summary_row}:I{summary_row}")
+
+    sub_hdr = ["Core", "Algorithm", "Processes", "Avg Turnaround", "Avg Waiting", "Avg Response"]
+    for col, h in enumerate(sub_hdr, 1):
+        cell = ws.cell(row=summary_row+1, column=col, value=h)
+        cell.font = WHITE; cell.fill = HDR_FILL
+        cell.alignment = CENTER; cell.border = BORDER
+
+    for c in range(NUM_CORES):
+        core_procs = [p for p in procs if p.assigned_core == c]
+        if not core_procs:
+            continue
+        ta_c = [p.finish_time - p.arrival           for p in core_procs]
+        wt_c = [p.finish_time - p.arrival - p.burst for p in core_procs]
+        rt_c = [p.first_run   - p.arrival            for p in core_procs]
+        row_data = [
+            f"Core {c}",
+            core_configs[c].label,
+            len(core_procs),
+            round(sum(ta_c)/len(ta_c), 2),
+            round(sum(wt_c)/len(wt_c), 2),
+            round(sum(rt_c)/len(rt_c), 2),
+        ]
+        r = summary_row + 2 + c
+        fill = PatternFill("solid", start_color="0F1E2E") if c % 2 == 0                else PatternFill("solid", start_color="122030")
+        for col, val in enumerate(row_data, 1):
+            cell = ws.cell(row=r, column=col, value=val)
+            cell.font = NORMAL; cell.fill = fill
+            cell.alignment = CENTER; cell.border = BORDER
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    widths = [10, 10, 16, 10, 8, 10, 14, 12, 12]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.row_dimensions[1].height = 22
+    ws.freeze_panes = "A5"
+
+    # ── Summary sheet – update or create ──────────────────────────────────────
+    if "Summary" not in wb.sheetnames:
+        ws_sum = wb.create_sheet("Summary", 0)
+        s_hdr = ["Run", "Combo", "Processes", "Total Ticks",
+                 "Avg Turnaround", "Avg Waiting", "Avg Response"]
+        for col, h in enumerate(s_hdr, 1):
+            cell = ws_sum.cell(row=1, column=col, value=h)
+            cell.font = WHITE; cell.fill = HDR_FILL
+            cell.alignment = CENTER; cell.border = BORDER
+        sum_widths = [6, 55, 12, 12, 16, 14, 14]
+        for i, w in enumerate(sum_widths, 1):
+            ws_sum.column_dimensions[get_column_letter(i)].width = w
+    else:
+        ws_sum = wb["Summary"]
+
+    sum_row = ws_sum.max_row + 1
+    ta_all = [p.finish_time - p.arrival           for p in procs]
+    wt_all = [p.finish_time - p.arrival - p.burst for p in procs]
+    rt_all = [p.first_run   - p.arrival            for p in procs]
+    fill_s = PatternFill("solid", start_color="0F1E2E") if run_num % 2 == 0              else PatternFill("solid", start_color="122030")
+    sum_data = [
+        run_num,
+        combo,
+        len(procs),
+        total_ticks,
+        round(sum(ta_all)/len(ta_all), 2),
+        round(sum(wt_all)/len(wt_all), 2),
+        round(sum(rt_all)/len(rt_all), 2),
+    ]
+    for col, val in enumerate(sum_data, 1):
+        cell = ws_sum.cell(row=sum_row, column=col, value=val)
+        cell.font = NORMAL; cell.fill = fill_s
+        cell.alignment = CENTER; cell.border = BORDER
+
+    wb.save(EXCEL_FILE)
+    print(f"\n  [Excel] Results saved to {EXCEL_FILE}  (sheet: {sheet_name})")
+
 
 # ── Main simulation ────────────────────────────────────────────────────────────
 
