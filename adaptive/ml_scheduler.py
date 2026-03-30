@@ -14,7 +14,7 @@ class Algorithm(Enum):
     SRT = "SRT"
     HRRN = "HRRN"
 
-
+SIM_EPOCHS = 3
 ALL_ALGORITHMS = [Algorithm.SPN, Algorithm.SRT, Algorithm.HRRN]
 ALGORITHM_NAMES = [alg.value for alg in ALL_ALGORITHMS]
 
@@ -340,7 +340,7 @@ class CPU:
 
     def epoch_boundary(self):
         boundary_time = self.system_time
-        epoch_end = boundary_time + self.epoch
+        epoch_end = boundary_time + SIM_EPOCHS * self.epoch
 
         if self.verbose:
             print(f"\nReached boundary at time {boundary_time}")
