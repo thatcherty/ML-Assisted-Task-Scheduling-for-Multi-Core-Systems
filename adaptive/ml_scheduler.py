@@ -10,16 +10,24 @@ from pathlib import Path
 
 
 class Algorithm(Enum):
-    SJF = "SJF"
+    SPN = "SPN"
     SRT = "SRT"
     HRRN = "HRRN"
 
 
-ALL_ALGORITHMS = [Algorithm.SJF, Algorithm.SRT, Algorithm.HRRN]
+ALL_ALGORITHMS = [Algorithm.SPN, Algorithm.SRT, Algorithm.HRRN]
 ALGORITHM_NAMES = [alg.value for alg in ALL_ALGORITHMS]
 
 
 def build_combo_maps(num_cores: int):
+    """
+    Deterministic class mapping using lexicographic itertools.product order.
+    This same mapping must be used for:
+      - dataset creation
+      - training
+      - prediction decoding
+      - class reporting
+    """
     combos = list(itertools.product(ALGORITHM_NAMES, repeat=num_cores))
     combo_to_class = {"|".join(combo): i for i, combo in enumerate(combos)}
     class_to_combo = {i: "|".join(combo) for i, combo in enumerate(combos)}
@@ -64,10 +72,6 @@ class Process:
         return self.burst - self.running_time
 
     def waiting_at_time(self, time: int) -> int:
-        """
-        Current waiting time at a given time for an unfinished process that has arrived.
-        waiting = time in system - running time
-        """
         if time < self.arrival:
             return 0
 
@@ -81,7 +85,7 @@ class Process:
 class Core:
     name: str
     running: int = -1
-    algorithm: Algorithm = Algorithm.SJF
+    algorithm: Algorithm = Algorithm.SPN
 
     def clone_for_sim(self):
         return Core(
@@ -91,8 +95,8 @@ class Core:
         )
 
     def schedule(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        if self.algorithm == Algorithm.SJF:
-            self.sjf(processes, ready, time, sim)
+        if self.algorithm == Algorithm.SPN:
+            self.spn(processes, ready, time, sim)
         elif self.algorithm == Algorithm.SRT:
             self.srt(processes, ready, time, sim)
         elif self.algorithm == Algorithm.HRRN:
@@ -117,8 +121,8 @@ class Core:
             return True
         return False
 
-    def sjf(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        # Non-preemptive
+    def spn(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
+        # Non-preemptive shortest process next
         if self.running == -1 and ready:
             pid = min(ready, key=lambda p: processes[p].burst)
             ready.remove(pid)
@@ -129,7 +133,7 @@ class Core:
             self._finish_if_done(processes, time + 1, sim)
 
     def srt(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        # Preemptive
+        # Preemptive shortest remaining time
         candidates = list(ready)
         if self.running != -1:
             candidates.append(self.running)
@@ -152,7 +156,7 @@ class Core:
         self._finish_if_done(processes, time + 1, sim)
 
     def hrrn(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        # Non-preemptive
+        # Non-preemptive highest response ratio next
         if self.running == -1 and ready:
             pid = max(
                 ready,
@@ -273,7 +277,6 @@ class CPU:
         wait_mean = float(np.mean(wait_vals)) if len(wait_vals) > 0 else 0.0
 
         return {
-            # Feature columns for model input
             "time": self.system_time,
             "ready_count": len(self.ready),
             "running_count": sum(1 for core in self.cores if core.running != -1),
@@ -290,11 +293,6 @@ class CPU:
         }
 
     def collect_epoch_metrics(self, boundary_time: int, epoch_end: int):
-        """
-        Collect outcome information from the look-ahead simulation.
-        These columns are useful for analysis, but should not be used as
-        model inputs because they come from the simulated future.
-        """
         arrived_unfinished = [
             p for p in self.processes
             if p.arrival <= epoch_end and (p.finish_time == -1 or p.finish_time > epoch_end)
@@ -321,7 +319,6 @@ class CPU:
         avg_response_started = float(np.mean(response_started)) if response_started else 0.0
 
         return {
-            # Outcome columns, not feature columns
             "score_avg_waiting_now": avg_waiting_now,
             "score_max_waiting_now": max_waiting_now,
             "score_waiting_variance_now": waiting_variance_now,
@@ -332,17 +329,6 @@ class CPU:
         }
 
     def score_metrics(self, metrics: dict) -> float:
-        """
-        Lower is better.
-
-        Promotes:
-        - lower average waiting
-        - lower max waiting
-        - lower wait variance for fairness
-        - lower remaining work
-        - lower response where relevant
-        - more completed jobs in the window
-        """
         return (
             0.30 * metrics["score_avg_waiting_now"] +
             0.25 * metrics["score_max_waiting_now"] +
@@ -396,17 +382,13 @@ class CPU:
 
         row = {
             **features,
-
-            # Recommended target columns
             "best_combo": best_combo_str,
             "combo_class": combo_class,
         }
 
-        # Separate per-core labels for optional multi-output modeling
         for i, alg in enumerate(best_combo):
             row[f"core{i}_alg"] = alg.value
 
-        # Outcome / analysis columns
         row["score"] = float(best_score)
         row.update(best_metrics)
 
@@ -438,9 +420,6 @@ class CPU:
         return pd.DataFrame(self.training_rows)
 
     def feature_columns(self) -> List[str]:
-        """
-        Columns appropriate for model input X.
-        """
         return [
             "time",
             "ready_count",
@@ -458,33 +437,49 @@ class CPU:
         ]
 
     def multiclass_target_column(self) -> str:
-        """
-        Single 81-class target for 4 cores and 3 algorithms.
-        """
         return "combo_class"
 
     def multioutput_target_columns(self) -> List[str]:
-        """
-        Optional per-core labels if you want to try multi-output classification.
-        """
         return [f"core{i}_alg" for i in range(self.num_cores)]
-    
+
+    def class_mapping_dataframe(self) -> pd.DataFrame:
+        rows = [
+            {"combo_class": class_id, "best_combo": combo}
+            for class_id, combo in sorted(self.class_to_combo.items())
+        ]
+        return pd.DataFrame(rows)
+
+    def class_distribution_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        counts = (
+            df["combo_class"]
+            .value_counts()
+            .sort_index()
+            .rename("count")
+            .reset_index()
+            .rename(columns={"index": "combo_class"})
+        )
+
+        mapping = self.class_mapping_dataframe()
+        merged = mapping.merge(counts, on="combo_class", how="left")
+        merged["count"] = merged["count"].fillna(0).astype(int)
+        return merged.sort_values("combo_class").reset_index(drop=True)
+
+
 def load_processes(filename: str) -> List[Process]:
     """
-    Load processes from a workload file in ../data relative to this script.
+    Load processes from ../data relative to this script.
 
-    Expected file format:
-        # comments...
+    Expected format:
+        # comments
         name,arrival,burst
         1,0,79
         2,0,61
         ...
 
-    Returns:
-        List[Process]
+    Internal indexing remains zero-based by list position.
+    The 'name' field is preserved from file.
     """
     file_path = Path(__file__).resolve().parent.parent / "data" / filename
-
     processes = []
 
     with file_path.open("r", encoding="cp1252") as f:
@@ -496,11 +491,9 @@ def load_processes(filename: str) -> List[Process]:
             if not line:
                 continue
 
-            # Skip comments
             if line.startswith("#"):
                 continue
 
-            # Skip CSV header
             if not header_found:
                 if line.lower() == "name,arrival,burst":
                     header_found = True
@@ -511,19 +504,13 @@ def load_processes(filename: str) -> List[Process]:
                 raise ValueError(f"Invalid row in {file_path}: {line}")
 
             name, arrival, burst = map(int, parts)
-
-            # If your process names in code are zero-based, subtract 1 here.
             processes.append(Process(name=name, arrival=arrival, burst=burst))
 
     return processes
 
 
 if __name__ == "__main__":
-    
     test = 0
-
-    cpu = None
-    processes = None
 
     if test:
         random.seed(42)
@@ -549,7 +536,7 @@ if __name__ == "__main__":
         )
 
     else:
-        processes = load_processes("short_processes.txt")
+        processes = load_processes("long_processes.txt")
 
         cpu = CPU(
             processes=processes,
@@ -559,13 +546,11 @@ if __name__ == "__main__":
             verbose=False
         )
 
-
     # Optional initial algorithms before first epoch selection
     cpu.cores = [Core(f"C{i}", algorithm=Algorithm.HRRN) for i in range(cpu.num_cores)]
 
     cpu.simulate()
 
-    # Final process summary
     print("\nP | C | A | B | S | F | T | W | R")
     for p in cpu.processes:
         print(
@@ -577,7 +562,10 @@ if __name__ == "__main__":
     df = cpu.training_dataframe()
 
     print("\nTraining dataset preview:")
-    print(df.head().to_string(index=False))
+    if not df.empty:
+        print(df.head().to_string(index=False))
+    else:
+        print("No training rows collected.")
 
     print("\nFeature columns for X:")
     print(cpu.feature_columns())
@@ -588,9 +576,24 @@ if __name__ == "__main__":
     print("\nOptional per-core target columns:")
     print(cpu.multioutput_target_columns())
 
-    print("\nClass distribution:")
-    print(df["combo_class"].value_counts().sort_index().to_string())
+    print("\nTotal training rows:")
+    print(len(df))
 
-    # Save dataset
+    print("\nFinal system time:")
+    print(cpu.system_time)
+
+    print("\nClass mapping:")
+    print(cpu.class_mapping_dataframe().to_string(index=False))
+
+    print("\nClass distribution with mapping:")
+    class_dist = cpu.class_distribution_dataframe(df)
+    print(class_dist.to_string(index=False))
+
+    # Save outputs
     df.to_csv("scheduler_training_dataset.csv", index=False)
+    cpu.class_mapping_dataframe().to_csv("scheduler_class_mapping.csv", index=False)
+    class_dist.to_csv("scheduler_class_distribution.csv", index=False)
+
     print("\nSaved dataset to scheduler_training_dataset.csv")
+    print("Saved class mapping to scheduler_class_mapping.csv")
+    print("Saved class distribution to scheduler_class_distribution.csv")
