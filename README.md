@@ -32,7 +32,7 @@ Each core maintains its own ready queue and scheduling algorithm. Scheduling alg
 
 The system collects workload features during execution and uses those features to determine which scheduling algorithm performs best for the current workload.
 
-Adaptive algorithm selection will be evaluated using two approaches:
+Adaptive algorithm selection will be evaluated using one or both of the following approaches:
 
 1. Rule-based scheduler selection
 2. Machine learning-based scheduler selection
@@ -45,9 +45,9 @@ Results will be compared against baseline scheduling strategies.
 
 The following scheduling algorithms will be implemented:
 
-- Round Robin
 - Shortest Job First
-- Priority Scheduling
+- Shortest Response Time
+- HRRN
 
 Each core can run any of these algorithms independently.
 
@@ -73,7 +73,7 @@ Processes with short CPU bursts.
 
 Burst times are generated using:
 
-`Uniform(1, 20)`
+`Uniform(1, 25)`
 
 ### Mixed Workloads
 
@@ -81,8 +81,8 @@ A mixture of short and long bursts.
 
 Example configuration:
 
-- 70% short bursts using `Uniform(1, 20)`
-- 30% long bursts using `Uniform(50, 200)`
+- 70% short bursts using `Uniform(1, 25)`
+- 30% long bursts using `Uniform(50, 100)`
 
 These workloads allow evaluation of scheduling performance under different conditions.
 
@@ -161,9 +161,9 @@ Baseline experiments apply the same scheduling algorithm to all cores.
 
 | Experiment | Core 1 | Core 2 | Core 3 | Core 4 |
 |-----------|--------|--------|--------|--------|
-| Baseline A | RR | RR | RR | RR |
+| Baseline A | SRT | SRT | SRT | SRT |
 | Baseline B | SJF | SJF | SJF | SJF |
-| Baseline C | Priority | Priority | Priority | Priority |
+| Baseline C | HRRN | HRRN | HRRN | HRRN |
 
 These results establish a reference for evaluating adaptive schedulers.
 
