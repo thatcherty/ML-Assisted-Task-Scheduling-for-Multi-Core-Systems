@@ -522,10 +522,10 @@ if __name__ == "__main__":
 
         for i in range(num_processes):
             if i == 0:
-                processes.append(Process(i, last_arrival, random.randint(1, 25)))
+                processes.append(Process(i, last_arrival, random.randint(50, 100)))
             else:
                 last_arrival += random.randint(0, 5)
-                processes.append(Process(i, last_arrival, random.randint(1, 25)))
+                processes.append(Process(i, last_arrival, random.randint(50, 100)))
 
         cpu = CPU(
             processes=processes,
@@ -536,11 +536,11 @@ if __name__ == "__main__":
         )
 
     else:
-        processes = load_processes("long_processes.txt")
+        processes = load_processes("short_processes.txt")
 
         cpu = CPU(
             processes=processes,
-            epoch=15,
+            epoch=25,
             num_cores=4,
             default_algorithm=Algorithm.HRRN,
             verbose=False
