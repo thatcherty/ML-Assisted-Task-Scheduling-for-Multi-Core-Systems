@@ -7,6 +7,10 @@ from typing import List, Deque
 from enum import Enum
 from collections import deque
 from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, classification_report
+import joblib
 
 
 class Algorithm(Enum):
@@ -509,13 +513,268 @@ def load_processes(filename: str) -> List[Process]:
     return processes
 
 
+
+def save_processes_to_txt(processes: List[Process], filename: str):
+    """
+    Save processes to ../data relative to this script using the format expected by load_processes().
+    """
+    file_path = Path(__file__).resolve().parent.parent / "data" / filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with file_path.open("w", encoding="utf-8") as f:
+        f.write("# Generated workload\n")
+        f.write("name,arrival,burst\n")
+        for p in processes:
+            f.write(f"{p.name},{p.arrival},{p.burst}\n")
+
+
+def generate_synthetic_workload(
+    num_processes: int,
+    workload_type: str,
+    short_range=(1, 20),
+    long_range=(50, 100),
+    long_ratio: float = 0.30
+) -> List[Process]:
+    """
+    Generate synthetic workloads with cumulative arrivals.
+    Rules:
+      - first process always arrives at 0
+      - every subsequent process arrival = previous arrival + randint(0, 5)
+      - short: bursts in short_range
+      - long: bursts in long_range
+      - mixed: 70% short and 30% long, randomly interleaved
+    """
+    if workload_type not in {"short", "long", "mixed"}:
+        raise ValueError("workload_type must be one of: short, long, mixed")
+
+    processes: List[Process] = []
+    arrival = 0
+
+    for i in range(num_processes):
+        if i == 0:
+            arrival = 0
+        else:
+            arrival += random.randint(0, 5)
+
+        if workload_type == "short":
+            burst = random.randint(*short_range)
+        elif workload_type == "long":
+            burst = random.randint(*long_range)
+        else:
+            is_long = random.random() < long_ratio
+            burst = random.randint(*(long_range if is_long else short_range))
+
+        processes.append(Process(name=i + 1, arrival=arrival, burst=burst))
+
+    return processes
+
+
+def generate_and_save_workloads(num_processes: int = 1000, force_regenerate: bool = False):
+    """
+    Ensure three workload files exist in ../data:
+      - short_1000_processes.txt
+      - long_1000_processes.txt
+      - mixed_1000_processes.txt
+
+    If a file already exists, it is reused.
+    If it does not exist, it is generated once and saved.
+    Set force_regenerate=True to overwrite existing files.
+    """
+    data_dir = Path(__file__).resolve().parent.parent / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    workload_specs = [
+        ("short_1000_processes.txt", "short"),
+        ("long_1000_processes.txt", "long"),
+        ("mixed_1000_processes.txt", "mixed"),
+    ]
+
+    workload_files = []
+    for filename, workload_type in workload_specs:
+        file_path = data_dir / filename
+
+        if force_regenerate or not file_path.exists():
+            processes = generate_synthetic_workload(
+                num_processes=num_processes,
+                workload_type=workload_type
+            )
+            save_processes_to_txt(processes, filename)
+
+        workload_files.append(filename)
+
+    return workload_files
+
+
+def run_workload_to_dataframe(
+    filename: str,
+    epoch: int = 25,
+    num_cores: int = 4,
+    default_algorithm: Algorithm = Algorithm.HRRN,
+    verbose: bool = False
+):
+    """
+    Load a workload file, run the existing simulator, and return the resulting CPU and training dataframe.
+    """
+    processes = load_processes(filename)
+
+    cpu = CPU(
+        processes=processes,
+        epoch=epoch,
+        num_cores=num_cores,
+        default_algorithm=default_algorithm,
+        verbose=verbose
+    )
+
+    cpu.cores = [Core(f"C{i}", algorithm=default_algorithm) for i in range(cpu.num_cores)]
+    cpu.simulate()
+
+    df = cpu.training_dataframe().copy()
+    df["workload_file"] = filename
+
+    return cpu, df
+
+
+def load_dataset_and_train_model(
+    dataset_path: str,
+    model_output_path: str = "scheduler_decision_tree.joblib"
+):
+    """
+    Load the saved dataframe and train a lightweight ML model.
+    """
+    df = pd.read_csv(dataset_path)
+
+    if df.empty:
+        raise ValueError("Dataset is empty. Cannot train model.")
+
+    feature_cols = [
+        "time",
+        "ready_count",
+        "running_count",
+        "unfinished_count",
+        "burst_mean",
+        "burst_variance",
+        "remaining_mean",
+        "remaining_variance",
+        "wait_mean",
+        "wait_variance",
+        "max_wait_current",
+        "short_job_ratio",
+        "arrival_rate",
+    ]
+    target_col = "combo_class"
+
+    X = df[feature_cols]
+    y = df[target_col]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+
+    model = DecisionTreeClassifier(random_state=42, max_depth=8, min_samples_leaf=5)
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+    accuracy = accuracy_score(y_test, preds)
+
+    joblib.dump(model, model_output_path)
+
+    return {
+        "model": model,
+        "accuracy": accuracy,
+        "classification_report": classification_report(y_test, preds, zero_division=0),
+        "rows": len(df),
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "model_path": model_output_path,
+    }
+
+
+def ensure_simulation_outputs(
+    workload_files: List[str],
+    dataset_path: str = "scheduler_training_dataset.csv",
+    mapping_path: str = "scheduler_class_mapping.csv",
+    class_dist_path: str = "scheduler_class_distribution.csv",
+    epoch: int = 25,
+    num_cores: int = 4,
+    default_algorithm: Algorithm = Algorithm.HRRN,
+    verbose: bool = False,
+    force_regenerate: bool = False
+):
+    """
+    Ensure the combined simulation dataset and supporting CSVs exist.
+
+    If the dataset files already exist, they are reused.
+    If they do not exist, workloads are loaded, simulated, and saved once.
+    Set force_regenerate=True to rerun simulations and overwrite outputs.
+    """
+    dataset_file = Path(dataset_path)
+    mapping_file = Path(mapping_path)
+    class_dist_file = Path(class_dist_path)
+
+    if (
+        not force_regenerate
+        and dataset_file.exists()
+        and mapping_file.exists()
+        and class_dist_file.exists()
+    ):
+        return {
+            "dataset_path": dataset_path,
+            "mapping_path": mapping_path,
+            "class_dist_path": class_dist_path,
+            "generated": False
+        }
+
+    all_results = []
+    class_mappings = []
+    class_distributions = []
+
+    for workload_file in workload_files:
+        cpu, df = run_workload_to_dataframe(
+            filename=workload_file,
+            epoch=epoch,
+            num_cores=num_cores,
+            default_algorithm=default_algorithm,
+            verbose=verbose
+        )
+
+        all_results.append(df)
+
+        mapping_df = cpu.class_mapping_dataframe().copy()
+        mapping_df["workload_file"] = workload_file
+        class_mappings.append(mapping_df)
+
+        class_dist = cpu.class_distribution_dataframe(df).copy()
+        class_dist["workload_file"] = workload_file
+        class_distributions.append(class_dist)
+
+        print(f"Completed workload: {workload_file}")
+        print(f"  Training rows collected: {len(df)}")
+        print(f"  Final system time: {cpu.system_time}")
+
+    combined_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    combined_mapping_df = pd.concat(class_mappings, ignore_index=True) if class_mappings else pd.DataFrame()
+    combined_class_dist_df = pd.concat(class_distributions, ignore_index=True) if class_distributions else pd.DataFrame()
+
+    combined_df.to_csv(dataset_path, index=False)
+    combined_mapping_df.to_csv(mapping_path, index=False)
+    combined_class_dist_df.to_csv(class_dist_path, index=False)
+
+    return {
+        "dataset_path": dataset_path,
+        "mapping_path": mapping_path,
+        "class_dist_path": class_dist_path,
+        "generated": True
+    }
+
+
+
 if __name__ == "__main__":
+    random.seed(42)
+    np.random.seed(42)
+
     test = 0
 
     if test:
-        random.seed(42)
-        np.random.seed(42)
-
         num_processes = 1000
         last_arrival = 0
         processes = []
@@ -535,65 +794,59 @@ if __name__ == "__main__":
             verbose=False
         )
 
-    else:
-        processes = load_processes("short_processes.txt")
+        cpu.cores = [Core(f"C{i}", algorithm=Algorithm.HRRN) for i in range(cpu.num_cores)]
+        cpu.simulate()
 
-        cpu = CPU(
-            processes=processes,
+        print("\nP | C | A | B | S | F | T | W | R")
+        for p in cpu.processes:
+            print(
+                f"{p.name} | {p.core} | {p.arrival} | {p.burst} | {p.start_time} | "
+                f"{p.finish_time} | {p.turnaround} | {p.waiting} | {p.response}"
+            )
+
+        df = cpu.training_dataframe()
+        print("\nTraining dataset preview:")
+        print(df.head().to_string(index=False) if not df.empty else "No training rows collected.")
+
+    else:
+        # Generate workloads only if they do not already exist
+        workload_files = generate_and_save_workloads(num_processes=1000, force_regenerate=False)
+
+        dataset_path = "scheduler_training_dataset.csv"
+        mapping_path = "scheduler_class_mapping.csv"
+        class_dist_path = "scheduler_class_distribution.csv"
+
+        simulation_outputs = ensure_simulation_outputs(
+            workload_files=workload_files,
+            dataset_path=dataset_path,
+            mapping_path=mapping_path,
+            class_dist_path=class_dist_path,
             epoch=25,
             num_cores=4,
             default_algorithm=Algorithm.HRRN,
-            verbose=False
+            verbose=False,
+            force_regenerate=False
         )
 
-    # Optional initial algorithms before first epoch selection
-    cpu.cores = [Core(f"C{i}", algorithm=Algorithm.HRRN) for i in range(cpu.num_cores)]
+        if simulation_outputs["generated"]:
+            print("\nSaved combined dataset to scheduler_training_dataset.csv")
+            print("Saved combined class mapping to scheduler_class_mapping.csv")
+            print("Saved combined class distribution to scheduler_class_distribution.csv")
+        else:
+            print("\nUsing existing scheduler_training_dataset.csv")
+            print("Using existing scheduler_class_mapping.csv")
+            print("Using existing scheduler_class_distribution.csv")
 
-    cpu.simulate()
-
-    print("\nP | C | A | B | S | F | T | W | R")
-    for p in cpu.processes:
-        print(
-            f"{p.name} | {p.core} | {p.arrival} | {p.burst} | {p.start_time} | "
-            f"{p.finish_time} | {p.turnaround} | {p.waiting} | {p.response}"
+        training_summary = load_dataset_and_train_model(
+            dataset_path=dataset_path,
+            model_output_path="scheduler_decision_tree.joblib"
         )
 
-    # Training dataset
-    df = cpu.training_dataframe()
-
-    print("\nTraining dataset preview:")
-    if not df.empty:
-        print(df.head().to_string(index=False))
-    else:
-        print("No training rows collected.")
-
-    print("\nFeature columns for X:")
-    print(cpu.feature_columns())
-
-    print("\nSingle multiclass target column for y:")
-    print(cpu.multiclass_target_column())
-
-    print("\nOptional per-core target columns:")
-    print(cpu.multioutput_target_columns())
-
-    print("\nTotal training rows:")
-    print(len(df))
-
-    print("\nFinal system time:")
-    print(cpu.system_time)
-
-    print("\nClass mapping:")
-    print(cpu.class_mapping_dataframe().to_string(index=False))
-
-    print("\nClass distribution with mapping:")
-    class_dist = cpu.class_distribution_dataframe(df)
-    print(class_dist.to_string(index=False))
-
-    # Save outputs
-    df.to_csv("scheduler_training_dataset.csv", index=False)
-    cpu.class_mapping_dataframe().to_csv("scheduler_class_mapping.csv", index=False)
-    class_dist.to_csv("scheduler_class_distribution.csv", index=False)
-
-    print("\nSaved dataset to scheduler_training_dataset.csv")
-    print("Saved class mapping to scheduler_class_mapping.csv")
-    print("Saved class distribution to scheduler_class_distribution.csv")
+        print("\nML training complete")
+        print(f"Rows: {training_summary['rows']}")
+        print(f"Train rows: {training_summary['train_rows']}")
+        print(f"Test rows: {training_summary['test_rows']}")
+        print(f"Accuracy: {training_summary['accuracy']:.4f}")
+        print(f"Saved model to: {training_summary['model_path']}")
+        print("\nClassification report:")
+        print(training_summary["classification_report"])
