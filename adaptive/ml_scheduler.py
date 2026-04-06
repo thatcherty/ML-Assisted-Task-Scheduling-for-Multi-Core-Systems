@@ -19,12 +19,12 @@ import joblib
 
 
 class Algorithm(Enum):
-    SPN = "SPN"
-    SRT = "SRT"
+    SJF = "SJF"
+    FCFS = "FCFS"
     HRRN = "HRRN"
 
 SIM_EPOCHS = 3
-ALL_ALGORITHMS = [Algorithm.SPN, Algorithm.SRT, Algorithm.HRRN]
+ALL_ALGORITHMS = [Algorithm.SJF, Algorithm.FCFS, Algorithm.HRRN]
 ALGORITHM_NAMES = [alg.value for alg in ALL_ALGORITHMS]
 
 
@@ -94,7 +94,7 @@ class Process:
 class Core:
     name: str
     running: int = -1
-    algorithm: Algorithm = Algorithm.SPN
+    algorithm: Algorithm = Algorithm.SJF
 
     def clone_for_sim(self):
         return Core(
@@ -104,10 +104,10 @@ class Core:
         )
 
     def schedule(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        if self.algorithm == Algorithm.SPN:
-            self.spn(processes, ready, time, sim)
-        elif self.algorithm == Algorithm.SRT:
-            self.srt(processes, ready, time, sim)
+        if self.algorithm == Algorithm.SJF:
+            self.sjf(processes, ready, time, sim)
+        elif self.algorithm == Algorithm.FCFS:
+            self.fcfs(processes, ready, time, sim)
         elif self.algorithm == Algorithm.HRRN:
             self.hrrn(processes, ready, time, sim)
 
@@ -130,8 +130,8 @@ class Core:
             return True
         return False
 
-    def spn(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        # Non-preemptive shortest process next
+    def sjf(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
+        # Non-preemptive shortest process next/shortest job first
         if self.running == -1 and ready:
             pid = min(ready, key=lambda p: processes[p].burst)
             ready.remove(pid)
@@ -141,28 +141,15 @@ class Core:
             processes[self.running].running_time += 1
             self._finish_if_done(processes, time + 1, sim)
 
-    def srt(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
-        # Preemptive shortest remaining time
-        candidates = list(ready)
+    def fcfs(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
+        # Non-preemptive first come first served
+        if self.running == -1 and ready:
+            pid = ready.popleft()
+            self._start_process(pid, processes, time)
+
         if self.running != -1:
-            candidates.append(self.running)
-
-        if not candidates:
-            return
-
-        best_pid = min(candidates, key=lambda p: processes[p].remaining_time)
-
-        if self.running != -1 and best_pid != self.running:
-            ready.append(self.running)
-            self.running = -1
-
-        if self.running == -1:
-            if best_pid in ready:
-                ready.remove(best_pid)
-            self._start_process(best_pid, processes, time)
-
-        processes[self.running].running_time += 1
-        self._finish_if_done(processes, time + 1, sim)
+            processes[self.running].running_time += 1
+            self._finish_if_done(processes, time + 1, sim)
 
     def hrrn(self, processes: List[Process], ready: Deque[int], time: int, sim: bool = False):
         # Non-preemptive highest response ratio next
@@ -340,18 +327,16 @@ class CPU:
             "score_max_waiting_now": max_waiting_now,
             "score_waiting_variance_now": waiting_variance_now,
             "score_avg_remaining_now": avg_remaining_now,
-            "score_avg_response_started": avg_response_started,
             "score_completed_count": len(completed_in_window),
             "score_unfinished_count_end": len(arrived_unfinished)
         }
 
     def score_metrics(self, metrics: dict) -> float:
         return (
-            0.30 * metrics["score_avg_waiting_now"] +
-            0.25 * metrics["score_max_waiting_now"] +
-            0.15 * metrics["score_waiting_variance_now"] +
-            0.15 * metrics["score_avg_remaining_now"] +
-            0.10 * metrics["score_avg_response_started"] -
+            0.35 * metrics["score_avg_waiting_now"] +
+            0.30 * metrics["score_max_waiting_now"] +
+            0.20 * metrics["score_waiting_variance_now"] +
+            0.15 * metrics["score_avg_remaining_now"] -
             0.15 * metrics["score_completed_count"]
         )
 
@@ -388,7 +373,6 @@ class CPU:
                 "score_max_waiting_now": float("inf"),
                 "score_waiting_variance_now": float("inf"),
                 "score_avg_remaining_now": float("inf"),
-                "score_avg_response_started": float("inf"),
                 "score_completed_count": 0,
                 "score_unfinished_count_end": len([p for p in self.processes if p.finish_time == -1]),
             }
@@ -1147,9 +1131,9 @@ if __name__ == "__main__":
             print(result["classification_report"])
 
         original_eval_files = [
-            "short_processes.txt",
-            "long_processes.txt",
-            "mixed_processes.txt",
+            "workloads/short_10000_processes.txt",
+            "workloads/long_10000_processes.txt",
+            "workloads/mixed_10000_processes.txt",
         ]
 
         eval_df = evaluate_saved_model_on_workloads(
