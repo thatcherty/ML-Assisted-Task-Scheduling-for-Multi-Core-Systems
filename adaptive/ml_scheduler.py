@@ -7,9 +7,14 @@ from typing import List, Deque
 from enum import Enum
 from collections import deque
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.compose import ColumnTransformer
+from imblearn.over_sampling import SMOTE
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import make_scorer, f1_score, precision_score, recall_score, accuracy_score, classification_report
 import joblib
 
 
@@ -187,6 +192,7 @@ class CPU:
     training_rows: List[dict] = field(default_factory=list)
     default_algorithm: Algorithm = Algorithm.HRRN
     verbose: bool = False
+    context_switches: int = 0
 
     def __post_init__(self):
         self.combo_to_class, self.class_to_combo = build_combo_maps(self.num_cores)
@@ -225,8 +231,14 @@ class CPU:
     def step(self, sim: bool = False):
         self.move_arrivals_to_ready()
 
+        prev_running = [core.running for core in self.cores]
+
         for core in self.cores:
             core.schedule(self.processes, self.ready, self.system_time, sim=sim)
+
+        for prev_pid, core in zip(prev_running, self.cores):
+            if prev_pid != -1 and core.running != prev_pid:
+                self.context_switches += 1
 
         self.update_done()
         self.system_time += 1
@@ -243,7 +255,8 @@ class CPU:
             num_cores=self.num_cores,
             training_rows=[],
             default_algorithm=self.default_algorithm,
-            verbose=False
+            verbose=False,
+            context_switches=self.context_switches
         )
 
     def simulate_until(self, end_time: int, sim: bool = False):
@@ -417,6 +430,66 @@ class CPU:
         while not self.all_finished():
             if self.system_time % self.epoch == 0:
                 self.epoch_boundary()
+
+            self.step(sim=self.verbose)
+
+    def summary_metrics(self) -> dict:
+        completed = [p for p in self.processes if p.finish_time != -1]
+
+        if not completed:
+            return {
+                "avg_turnaround": 0.0,
+                "avg_response": 0.0,
+                "avg_waiting": 0.0,
+                "total_context_switches": self.context_switches,
+            }
+
+        turnaround_vals = [p.turnaround for p in completed if p.turnaround != -1]
+        response_vals = [p.response for p in completed if p.response != -1]
+        waiting_vals = [p.waiting for p in completed if p.waiting != -1]
+
+        return {
+            "avg_turnaround": float(np.mean(turnaround_vals)) if turnaround_vals else 0.0,
+            "avg_response": float(np.mean(response_vals)) if response_vals else 0.0,
+            "avg_waiting": float(np.mean(waiting_vals)) if waiting_vals else 0.0,
+            "total_context_switches": int(self.context_switches),
+        }
+
+    def predict_epoch_boundary(self, model_artifact: dict):
+        features = self.extract_boundary_features()
+        features_df = pd.DataFrame([features])
+
+        predicted_algs = []
+        for i in range(self.num_cores):
+            target_col = f"core{i}_alg"
+            model = model_artifact["models"].get(target_col)
+
+            if model is None:
+                predicted_algs.append(self.default_algorithm)
+                continue
+
+            pred = model.predict(features_df)[0]
+            if isinstance(pred, Algorithm):
+                predicted_algs.append(pred)
+            else:
+                predicted_algs.append(Algorithm(str(pred)))
+
+        self.assign_algorithms(tuple(predicted_algs))
+
+        if self.verbose:
+            print(
+                f"Predicted algorithms at time {self.system_time}: "
+                f"{[alg.value for alg in predicted_algs]}"
+            )
+
+    def simulate_with_model(self, model_artifact: dict):
+        self.init_cores()
+        self.init_queue()
+        self.update_done()
+
+        while not self.all_finished():
+            if self.system_time % self.epoch == 0:
+                self.predict_epoch_boundary(model_artifact)
 
             self.step(sim=self.verbose)
 
@@ -636,15 +709,44 @@ def run_workload_to_dataframe(
 
 def load_dataset_and_train_model(
     dataset_path: str,
-    model_output_path: str = "scheduler_decision_tree.joblib"
+    model_output_path: str = "scheduler_per_core_models.joblib",
+    n_splits: int = 5,
+    min_class_count: int | None = None
 ):
     """
-    Load the saved dataframe and train a lightweight ML model.
+    Load the saved dataframe and train one model per core algorithm target.
+
+    The existing dataset already supports this because it contains:
+      - core0_alg
+      - core1_alg
+      - core2_alg
+      - core3_alg
+
+    Rare labels are filtered per-core and reported.
     """
     df = pd.read_csv(dataset_path)
 
     if df.empty:
         raise ValueError("Dataset is empty. Cannot train model.")
+
+    def build_preprocessor(X: pd.DataFrame):
+        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_cols = [col for col in X.columns if col not in numeric_cols]
+
+        numeric_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ])
+
+        categorical_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+        ])
+
+        return ColumnTransformer([
+            ("num", numeric_pipeline, numeric_cols),
+            ("cat", categorical_pipeline, categorical_cols)
+        ])
 
     feature_cols = [
         "time",
@@ -661,33 +763,192 @@ def load_dataset_and_train_model(
         "short_job_ratio",
         "arrival_rate",
     ]
-    target_col = "combo_class"
 
-    X = df[feature_cols]
-    y = df[target_col]
+    target_cols = [col for col in df.columns if col.startswith("core") and col.endswith("_alg")]
+    if not target_cols:
+        raise ValueError("No per-core target columns found in dataset.")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
+    if min_class_count is None:
+        min_class_count = max(2, n_splits)
 
-    model = DecisionTreeClassifier(random_state=42, max_depth=8, min_samples_leaf=5)
-    model.fit(X_train, y_train)
+    trained_models = {}
+    per_core_results = {}
 
-    preds = model.predict(X_test)
-    accuracy = accuracy_score(y_test, preds)
+    for target_col in target_cols:
+        target_df = df[feature_cols + [target_col]].dropna().copy()
 
-    joblib.dump(model, model_output_path)
+        original_label_counts = target_df[target_col].value_counts().sort_index()
+        excluded_label_counts = original_label_counts[original_label_counts < min_class_count]
+        kept_labels = original_label_counts[original_label_counts >= min_class_count].index
+
+        filtered_df = target_df[target_df[target_col].isin(kept_labels)].copy()
+
+        if filtered_df.empty:
+            per_core_results[target_col] = {
+                "trained": False,
+                "reason": f"No rows remain after filtering labels with fewer than {min_class_count} samples.",
+                "rows_original": len(target_df),
+                "rows_after_filter": 0,
+                "labels_original": int(original_label_counts.shape[0]),
+                "labels_after_filter": 0,
+                "excluded_labels": excluded_label_counts.to_dict(),
+            }
+            continue
+
+        filtered_label_counts = filtered_df[target_col].value_counts().sort_index()
+        smallest_class = int(filtered_label_counts.min())
+
+        if smallest_class < 2:
+            per_core_results[target_col] = {
+                "trained": False,
+                "reason": "Not enough class support after filtering for stratified train/test split.",
+                "rows_original": len(target_df),
+                "rows_after_filter": len(filtered_df),
+                "labels_original": int(original_label_counts.shape[0]),
+                "labels_after_filter": int(filtered_label_counts.shape[0]),
+                "excluded_labels": excluded_label_counts.to_dict(),
+            }
+            continue
+
+        X = filtered_df[feature_cols]
+        y = filtered_df[target_col]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=42, stratify=y
+        )
+
+        preprocessor = build_preprocessor(X_train)
+
+        model = RandomForestClassifier(
+            random_state=42,
+            n_estimators=200,
+            max_depth=None,
+            min_samples_leaf=2,
+            class_weight="balanced_subsample"
+        )
+
+        pipe = Pipeline([
+            ("preprocessor", preprocessor),
+            ("random_forest", model)
+        ])
+
+        safe_splits = min(n_splits, smallest_class)
+        if safe_splits < 2:
+            per_core_results[target_col] = {
+                "trained": False,
+                "reason": "Not enough class support for stratified cross-validation.",
+                "rows_original": len(target_df),
+                "rows_after_filter": len(filtered_df),
+                "labels_original": int(original_label_counts.shape[0]),
+                "labels_after_filter": int(filtered_label_counts.shape[0]),
+                "excluded_labels": excluded_label_counts.to_dict(),
+            }
+            continue
+
+        cv = StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+
+        cv_results = cross_validate(
+            pipe,
+            X,
+            y,
+            cv=cv,
+            scoring=["f1_macro", "accuracy"],
+            return_train_score=False
+        )
+
+        pipe.fit(X_train, y_train)
+        preds = pipe.predict(X_test)
+
+        trained_models[target_col] = pipe
+        per_core_results[target_col] = {
+            "trained": True,
+            "accuracy": float(np.mean(cv_results["test_accuracy"])),
+            "f1_score": float(np.mean(cv_results["test_f1_macro"])),
+            "classification_report": classification_report(y_test, preds, zero_division=0),
+            "rows_original": len(target_df),
+            "rows_after_filter": len(filtered_df),
+            "train_rows": len(X_train),
+            "test_rows": len(X_test),
+            "labels_original": int(original_label_counts.shape[0]),
+            "labels_after_filter": int(filtered_label_counts.shape[0]),
+            "excluded_label_count": int(excluded_label_counts.shape[0]),
+            "excluded_labels": excluded_label_counts.to_dict(),
+            "min_class_count_used": int(min_class_count),
+            "cv_splits_used": int(safe_splits),
+        }
+
+    if not trained_models:
+        raise ValueError("No per-core models could be trained after filtering rare labels.")
+
+    artifact = {
+        "feature_columns": feature_cols,
+        "target_columns": target_cols,
+        "models": trained_models,
+        "per_core_results": per_core_results,
+    }
+
+    joblib.dump(artifact, model_output_path)
+
+    trained_core_metrics = [
+        result for result in per_core_results.values()
+        if result.get("trained", False)
+    ]
+
+    mean_accuracy = float(np.mean([r["accuracy"] for r in trained_core_metrics])) if trained_core_metrics else 0.0
+    mean_f1 = float(np.mean([r["f1_score"] for r in trained_core_metrics])) if trained_core_metrics else 0.0
 
     return {
-        "model": model,
-        "accuracy": accuracy,
-        "classification_report": classification_report(y_test, preds, zero_division=0),
+        "model": artifact,
+        "per_core_results": per_core_results,
+        "accuracy": mean_accuracy,
+        "f1_score": mean_f1,
         "rows": len(df),
-        "train_rows": len(X_train),
-        "test_rows": len(X_test),
         "model_path": model_output_path,
     }
 
+
+
+def evaluate_saved_model_on_workloads(
+    model_path: str,
+    workload_files: List[str],
+    epoch: int = 25,
+    num_cores: int = 4,
+    default_algorithm: Algorithm = Algorithm.HRRN,
+    verbose: bool = False
+) -> pd.DataFrame:
+    """
+    Load a saved per-core model bundle and evaluate it on workload files.
+
+    Returns a dataframe with:
+      - workload_file
+      - avg_turnaround
+      - avg_response
+      - avg_waiting
+      - total_context_switches
+    """
+    artifact = joblib.load(model_path)
+
+    rows = []
+    for workload_file in workload_files:
+        processes = load_processes(workload_file)
+
+        cpu = CPU(
+            processes=processes,
+            epoch=epoch,
+            num_cores=num_cores,
+            default_algorithm=default_algorithm,
+            verbose=verbose
+        )
+        cpu.cores = [Core(f"C{i}", algorithm=default_algorithm) for i in range(cpu.num_cores)]
+        cpu.simulate_with_model(artifact)
+
+        metrics = cpu.summary_metrics()
+        rows.append({
+            "workload_file": workload_file,
+            **metrics
+        })
+
+    return pd.DataFrame(rows)
 
 def ensure_simulation_outputs(
     workload_files: List[str],
@@ -810,7 +1071,7 @@ if __name__ == "__main__":
 
     else:
         # Generate workloads only if they do not already exist
-        workload_files = generate_and_save_workloads(num_processes=1000, force_regenerate=False)
+        workload_files = generate_and_save_workloads(num_processes=10000, force_regenerate=False)
 
         dataset_path = "scheduler_training_dataset.csv"
         mapping_path = "scheduler_class_mapping.csv"
@@ -843,10 +1104,66 @@ if __name__ == "__main__":
         )
 
         print("\nML training complete")
-        print(f"Rows: {training_summary['rows']}")
-        print(f"Train rows: {training_summary['train_rows']}")
-        print(f"Test rows: {training_summary['test_rows']}")
-        print(f"Accuracy: {training_summary['accuracy']:.4f}")
-        print(f"Saved model to: {training_summary['model_path']}")
-        print("\nClassification report:")
-        print(training_summary["classification_report"])
+        print(f"Dataset rows: {training_summary['rows']}")
+        print(f"Mean per-core CV Accuracy: {training_summary['accuracy']:.4f}")
+        print(f"Mean per-core CV F1 Macro: {training_summary['f1_score']:.4f}")
+        print(f"Saved model bundle to: {training_summary['model_path']}")
+
+        print("\nPer-core results:")
+        for target_col, result in training_summary["per_core_results"].items():
+            print(f"\n{target_col}")
+            if not result.get("trained", False):
+                print("  Trained: False")
+                print(f"  Reason: {result.get('reason', 'Unknown')}")
+                print(f"  Rows original: {result.get('rows_original', 0)}")
+                print(f"  Rows after filter: {result.get('rows_after_filter', 0)}")
+                print(f"  Labels original: {result.get('labels_original', 0)}")
+                print(f"  Labels after filter: {result.get('labels_after_filter', 0)}")
+                if result.get("excluded_labels"):
+                    print("  Excluded labels:")
+                    for label, count in result["excluded_labels"].items():
+                        print(f"    {label}: {count} sample(s)")
+                else:
+                    print("  Excluded labels: none")
+                continue
+
+            print("  Trained: True")
+            print(f"  Rows original: {result['rows_original']}")
+            print(f"  Rows after filter: {result['rows_after_filter']}")
+            print(f"  Train rows: {result['train_rows']}")
+            print(f"  Test rows: {result['test_rows']}")
+            print(f"  Labels original: {result['labels_original']}")
+            print(f"  Labels after filter: {result['labels_after_filter']}")
+            print(f"  Excluded labels: {result['excluded_label_count']}")
+            if result["excluded_labels"]:
+                for label, count in result["excluded_labels"].items():
+                    print(f"    {label}: {count} sample(s)")
+            else:
+                print("    none")
+            print(f"  CV splits used: {result['cv_splits_used']}")
+            print(f"  Accuracy: {result['accuracy']:.4f}")
+            print(f"  F1 Macro: {result['f1_score']:.4f}")
+            print("  Classification report:")
+            print(result["classification_report"])
+
+        original_eval_files = [
+            "short_processes.txt",
+            "long_processes.txt",
+            "mixed_processes.txt",
+        ]
+
+        eval_df = evaluate_saved_model_on_workloads(
+            model_path=training_summary["model_path"],
+            workload_files=original_eval_files,
+            epoch=25,
+            num_cores=4,
+            default_algorithm=Algorithm.HRRN,
+            verbose=False
+        )
+
+        eval_output_path = "scheduler_original_100_process_evaluation.csv"
+        eval_df.to_csv(eval_output_path, index=False)
+
+        print("\nEvaluation on original 100-process workloads:")
+        print(eval_df.to_string(index=False))
+        print(f"\nSaved workload evaluation to: {eval_output_path}")
