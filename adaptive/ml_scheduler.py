@@ -528,7 +528,7 @@ class CPU:
 
 def load_processes(filename: str) -> List[Process]:
     """
-    Load processes from ../data relative to this script.
+    Load processes from ../workloads relative to this script.
 
     Expected format:
         # comments
@@ -540,7 +540,7 @@ def load_processes(filename: str) -> List[Process]:
     Internal indexing remains zero-based by list position.
     The 'name' field is preserved from file.
     """
-    file_path = Path(__file__).resolve().parent.parent / "data" / filename
+    file_path = Path(__file__).resolve().parent.parent / "workloads" / filename
     processes = []
 
     with file_path.open("r", encoding="cp1252") as f:
@@ -573,9 +573,9 @@ def load_processes(filename: str) -> List[Process]:
 
 def save_processes_to_txt(processes: List[Process], filename: str):
     """
-    Save processes to ../data relative to this script using the format expected by load_processes().
+    Save processes to ../workloads relative to this script using the format expected by load_processes().
     """
-    file_path = Path(__file__).resolve().parent.parent / "data" / filename
+    file_path = Path(__file__).resolve().parent.parent / "workloads" / filename
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     with file_path.open("w", encoding="utf-8") as f:
@@ -628,22 +628,22 @@ def generate_synthetic_workload(
 
 def generate_and_save_workloads(num_processes: int = 1000, force_regenerate: bool = False):
     """
-    Ensure three workload files exist in ../data:
-      - short_1000_processes.txt
-      - long_1000_processes.txt
-      - mixed_1000_processes.txt
+    Ensure three workload files exist in ../workloads:
+      - short_10000_processes.txt
+      - long_10000_processes.txt
+      - mixed_10000_processes.txt
 
     If a file already exists, it is reused.
     If it does not exist, it is generated once and saved.
     Set force_regenerate=True to overwrite existing files.
     """
-    data_dir = Path(__file__).resolve().parent.parent / "data"
+    data_dir = Path(__file__).resolve().parent.parent / "workloads"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     workload_specs = [
-        ("short_1000_processes.txt", "short"),
-        ("long_1000_processes.txt", "long"),
-        ("mixed_1000_processes.txt", "mixed"),
+        ("short_10000_processes.txt", "short"),
+        ("long_10000_processes.txt", "long"),
+        ("mixed_10000_processes.txt", "mixed"),
     ]
 
     workload_files = []
@@ -656,6 +656,8 @@ def generate_and_save_workloads(num_processes: int = 1000, force_regenerate: boo
                 workload_type=workload_type
             )
             save_processes_to_txt(processes, filename)
+        else:
+            print(f"Using existing file {file_path}.")
 
         workload_files.append(filename)
 
