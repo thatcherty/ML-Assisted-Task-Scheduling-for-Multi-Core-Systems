@@ -1,0 +1,4 @@
+completed_processes,total_processes,completion_ratio,avg_turnaround,avg_normalized_turnaround,avg_response,avg_waiting,avg_normalized_waiting,total_context_switches,workload_file,final_system_time,training_rows_collected
+1000,1000,1.0,48.53,3.1860988318355195,37.837,37.837,2.1860988318355195,1000,short_1000_processes.txt,2698,108
+1000,1000,1.0,7598.125,94.7529213624182,7522.48,7522.48,93.7529213624182,1000,long_1000_processes.txt,18945,758
+1000,1000,1.0,1315.267,37.63453941174569,1285.387,1285.387,36.63453941174569,1003,mixed_1000_processes.txt,7489,300

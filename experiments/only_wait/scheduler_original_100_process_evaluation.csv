@@ -1,0 +1,4 @@
+workload_file,completed_processes,total_processes,completion_ratio,avg_turnaround,avg_normalized_turnaround,avg_response,avg_waiting,avg_normalized_waiting,total_context_switches
+data/short_processes.txt,100,100,1.0,42.47,2.48409728442539,29.58,29.58,1.4840972844253904,101
+data/long_processes.txt,100,100,1.0,758.79,9.18434894937026,684.04,684.04,8.18434894937026,100
+data/mixed_processes.txt,100,100,1.0,136.96,2.9337276268915207,105.8,105.8,1.9337276268915207,100

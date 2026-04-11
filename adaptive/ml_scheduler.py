@@ -13,7 +13,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import make_scorer, f1_score, precision_score, recall_score, accuracy_score, classification_report
 import joblib
 
@@ -177,9 +178,11 @@ class CPU:
     epoch: int = 10
     num_cores: int = 4
     training_rows: List[dict] = field(default_factory=list)
-    default_algorithm: Algorithm = Algorithm.HRRN
+    default_algorithm: Algorithm = Algorithm.SJF
     verbose: bool = False
     context_switches: int = 0
+    tie_count: int = 0
+    tie_rows: List[dict] = field(default_factory=list)
 
     def __post_init__(self):
         self.combo_to_class, self.class_to_combo = build_combo_maps(self.num_cores)
@@ -224,8 +227,16 @@ class CPU:
             core.schedule(self.processes, self.ready, self.system_time, sim=sim)
 
         for prev_pid, core in zip(prev_running, self.cores):
-            if prev_pid != -1 and core.running != prev_pid:
-                self.context_switches += 1
+            curr_pid = core.running
+
+            # Count any dispatch/change in running process.
+            # This includes:
+            #   idle -> process   (initial dispatch)
+            #   process -> idle   (process completed)
+            #   process -> process (preemption / replacement)
+            if curr_pid != prev_pid:
+                if prev_pid != -1 or curr_pid != -1:
+                    self.context_switches += 1
 
         self.update_done()
         self.system_time += 1
@@ -243,7 +254,9 @@ class CPU:
             training_rows=[],
             default_algorithm=self.default_algorithm,
             verbose=False,
-            context_switches=self.context_switches
+            context_switches=self.context_switches,
+            tie_count=self.tie_count,
+            tie_rows=[]
         )
 
     def simulate_until(self, end_time: int, sim: bool = False):
@@ -296,49 +309,92 @@ class CPU:
             "arrival_rate": arrival_rate,
         }
 
-    def collect_epoch_metrics(self, boundary_time: int, epoch_end: int):
-        arrived_unfinished = [
-            p for p in self.processes
-            if p.arrival <= epoch_end and (p.finish_time == -1 or p.finish_time > epoch_end)
-        ]
-
+    def collect_epoch_metrics(self, boundary_time: int, epoch_end: int, context_switches_at_boundary: int = 0):
         completed_in_window = [
             p for p in self.processes
             if p.finish_time != -1 and boundary_time < p.finish_time <= epoch_end
         ]
 
-        started_in_window = [
+        arrived_unfinished = [
             p for p in self.processes
-            if p.start_time != -1 and boundary_time <= p.start_time < epoch_end
+            if p.arrival <= epoch_end and (p.finish_time == -1 or p.finish_time > epoch_end)
         ]
 
+        turnaround_vals = [p.turnaround for p in completed_in_window if p.turnaround != -1]
+        waiting_vals = [p.waiting for p in completed_in_window if p.waiting != -1]
         waiting_now = [p.waiting_at_time(epoch_end) for p in arrived_unfinished]
-        remaining_now = [p.remaining_time for p in arrived_unfinished]
-        response_started = [p.response for p in started_in_window if p.response != -1]
 
-        avg_waiting_now = float(np.mean(waiting_now)) if waiting_now else 0.0
+        avg_turnaround = float(np.mean(turnaround_vals)) if turnaround_vals else float("inf")
+        avg_waiting = float(np.mean(waiting_vals)) if waiting_vals else float("inf")
         max_waiting_now = float(np.max(waiting_now)) if waiting_now else 0.0
         waiting_variance_now = float(np.var(waiting_now, ddof=1)) if len(waiting_now) > 1 else 0.0
-        avg_remaining_now = float(np.mean(remaining_now)) if remaining_now else 0.0
-        avg_response_started = float(np.mean(response_started)) if response_started else 0.0
+        context_switch_delta = int(self.context_switches - context_switches_at_boundary)
 
         return {
-            "score_avg_waiting_now": avg_waiting_now,
+            "score_avg_turnaround": avg_turnaround,
+            "score_avg_waiting": avg_waiting,
             "score_max_waiting_now": max_waiting_now,
             "score_waiting_variance_now": waiting_variance_now,
-            "score_avg_remaining_now": avg_remaining_now,
-            "score_completed_count": len(completed_in_window),
-            "score_unfinished_count_end": len(arrived_unfinished)
+            "score_context_switches": context_switch_delta,
+            "score_completed_count": len(completed_in_window)
         }
 
-    def score_metrics(self, metrics: dict) -> float:
-        return (
-            0.35 * metrics["score_avg_waiting_now"] +
-            0.30 * metrics["score_max_waiting_now"] +
-            0.20 * metrics["score_waiting_variance_now"] +
-            0.15 * metrics["score_avg_remaining_now"] -
-            0.15 * metrics["score_completed_count"]
+    def score_metrics(self, metrics: dict, norm_stats: dict) -> float:
+        def bounded_sigmoid_score(val, mean_v, std_v):
+            if np.isinf(val):
+                return 1.0
+            if std_v == 0:
+                return 0.5
+            z = (val - mean_v) / std_v
+            score = 1.0 / (1.0 + np.exp(-z))
+            return float(np.clip(score, 0.0, 1.0))
+
+        turnaround = bounded_sigmoid_score(
+            metrics["score_avg_turnaround"],
+            norm_stats["turnaround_mean"],
+            norm_stats["turnaround_std"]
         )
+
+        waiting = bounded_sigmoid_score(
+            metrics["score_avg_waiting"],
+            norm_stats["waiting_mean"],
+            norm_stats["waiting_std"]
+        )
+
+        max_wait = bounded_sigmoid_score(
+            metrics["score_max_waiting_now"],
+            norm_stats["max_wait_mean"],
+            norm_stats["max_wait_std"]
+        )
+
+        variance = bounded_sigmoid_score(
+            metrics["score_waiting_variance_now"],
+            norm_stats["variance_mean"],
+            norm_stats["variance_std"]
+        )
+
+        context = bounded_sigmoid_score(
+            metrics["score_context_switches"],
+            norm_stats["context_mean"],
+            norm_stats["context_std"]
+        )
+
+        # Priority:
+        # 1) Turnaround
+        # 2) Waiting
+        # 3) Fairness (max wait + variance)
+        # 4) Context switch overhead
+        weighted_sum = (
+            2.5 * turnaround +
+            1.5 * waiting +
+            1.0 * max_wait +
+            0.5 * variance +
+            0.25 * context
+        )
+
+        total_weight = 2.5 + 1.5 + 1.0 + 0.5 + 0.25
+        final_score = weighted_sum / total_weight
+        return float(np.clip(final_score, 0.0, 1.0))
 
     def epoch_boundary(self):
         boundary_time = self.system_time
@@ -350,35 +406,92 @@ class CPU:
         features = self.extract_boundary_features()
 
         best_score = float("inf")
-        best_combo = None
-        best_metrics = None
+        best_combos = []
+        best_metrics_by_combo = {}
+
+        all_metrics = []
 
         for combo in self.generate_algorithm_combinations():
             sim_cpu = self.clone_for_epoch_simulation()
             sim_cpu.assign_algorithms(combo)
+            context_switches_at_boundary = sim_cpu.context_switches
             sim_cpu.simulate_until(epoch_end, sim=False)
 
-            metrics = sim_cpu.collect_epoch_metrics(boundary_time, epoch_end)
-            score = sim_cpu.score_metrics(metrics)
+            metrics = sim_cpu.collect_epoch_metrics(
+                boundary_time,
+                epoch_end,
+                context_switches_at_boundary=context_switches_at_boundary
+            )
+            all_metrics.append((combo, metrics))
 
-            if score < best_score:
-                best_score = score
-                best_combo = combo
-                best_metrics = metrics
+        if all_metrics:
+            def finite_or_zero(values):
+                cleaned = [0.0 if np.isinf(v) else float(v) for v in values]
+                return np.array(cleaned, dtype=float)
 
-        if best_combo is None:
+            turnaround_vals = finite_or_zero([m["score_avg_turnaround"] for _, m in all_metrics])
+            waiting_vals = finite_or_zero([m["score_avg_waiting"] for _, m in all_metrics])
+            max_wait_vals = finite_or_zero([m["score_max_waiting_now"] for _, m in all_metrics])
+            variance_vals = finite_or_zero([m["score_waiting_variance_now"] for _, m in all_metrics])
+            context_vals = finite_or_zero([m["score_context_switches"] for _, m in all_metrics])
+
+            norm_stats = {
+                "turnaround_mean": float(np.mean(turnaround_vals)),
+                "turnaround_std": float(np.std(turnaround_vals)),
+                "waiting_mean": float(np.mean(waiting_vals)),
+                "waiting_std": float(np.std(waiting_vals)),
+                "max_wait_mean": float(np.mean(max_wait_vals)),
+                "max_wait_std": float(np.std(max_wait_vals)),
+                "variance_mean": float(np.mean(variance_vals)),
+                "variance_std": float(np.std(variance_vals)),
+                "context_mean": float(np.mean(context_vals)),
+                "context_std": float(np.std(context_vals)),
+            }
+
+            for combo, metrics in all_metrics:
+                score = self.score_metrics(metrics, norm_stats)
+                combo_str = "|".join(alg.value for alg in combo)
+
+                if score < best_score:
+                    best_score = score
+                    best_combos = [combo]
+                    best_metrics_by_combo = {combo_str: metrics}
+                elif np.isclose(score, best_score, rtol=0.0, atol=1e-12):
+                    best_combos.append(combo)
+                    best_metrics_by_combo[combo_str] = metrics
+
+        if best_combos:
+            if len(best_combos) > 1:
+                self.tie_count += 1
+                tied_combo_strings = ["|".join(alg.value for alg in combo) for combo in best_combos]
+                self.tie_rows.append({
+                    "boundary_time": boundary_time,
+                    "epoch_end": epoch_end,
+                    "tie_count_at_boundary": len(best_combos),
+                    "tied_combos": " ; ".join(tied_combo_strings),
+                    "selected_combo": ""
+                })
+
+            selected_index = random.randrange(len(best_combos))
+            best_combo = best_combos[selected_index]
+            best_combo_str = "|".join(alg.value for alg in best_combo)
+            best_metrics = best_metrics_by_combo[best_combo_str]
+
+            if len(best_combos) > 1:
+                self.tie_rows[-1]["selected_combo"] = best_combo_str
+        else:
             best_combo = tuple(core.algorithm for core in self.cores)
             best_metrics = {
-                "score_avg_waiting_now": float("inf"),
+                "score_avg_turnaround": float("inf"),
+                "score_avg_waiting": float("inf"),
                 "score_max_waiting_now": float("inf"),
                 "score_waiting_variance_now": float("inf"),
-                "score_avg_remaining_now": float("inf"),
+                "score_context_switches": float("inf"),
                 "score_completed_count": 0,
-                "score_unfinished_count_end": len([p for p in self.processes if p.finish_time == -1]),
             }
-            best_score = float("inf")
+            best_score = 1.0
+            best_combo_str = "|".join(alg.value for alg in best_combo)
 
-        best_combo_str = "|".join(alg.value for alg in best_combo)
         combo_class = self.combo_to_class[best_combo_str]
 
         row = {
@@ -390,7 +503,7 @@ class CPU:
         for i, alg in enumerate(best_combo):
             row[f"core{i}_alg"] = alg.value
 
-        row["score"] = float(best_score)
+        row["score"] = float(np.clip(best_score, 0.0, 1.0))
         row.update(best_metrics)
 
         self.training_rows.append(row)
@@ -403,7 +516,7 @@ class CPU:
                 "| Class:",
                 combo_class,
                 "| Score:",
-                round(best_score, 4) if np.isfinite(best_score) else "inf"
+                round(row["score"], 4)
             )
 
     def simulate(self):
@@ -417,25 +530,49 @@ class CPU:
 
             self.step(sim=self.verbose)
 
+    def tie_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self.tie_rows)
+
     def summary_metrics(self) -> dict:
         completed = [p for p in self.processes if p.finish_time != -1]
+        completed_count = len(completed)
+        total_count = len(self.processes)
+        completion_ratio = (completed_count / total_count) if total_count > 0 else 0.0
 
         if not completed:
             return {
+                "completed_processes": completed_count,
+                "total_processes": total_count,
+                "completion_ratio": completion_ratio,
                 "avg_turnaround": 0.0,
+                "avg_normalized_turnaround": 0.0,
                 "avg_response": 0.0,
                 "avg_waiting": 0.0,
-                "total_context_switches": self.context_switches,
+                "avg_normalized_waiting": 0.0,
+                "total_context_switches": int(self.context_switches),
             }
 
         turnaround_vals = [p.turnaround for p in completed if p.turnaround != -1]
         response_vals = [p.response for p in completed if p.response != -1]
         waiting_vals = [p.waiting for p in completed if p.waiting != -1]
+        normalized_turnaround_vals = [
+            (p.turnaround / p.burst) for p in completed
+            if p.turnaround != -1 and p.burst > 0
+        ]
+        normalized_waiting_vals = [
+            (p.waiting / p.burst) for p in completed
+            if p.waiting != -1 and p.burst > 0
+        ]
 
         return {
+            "completed_processes": completed_count,
+            "total_processes": total_count,
+            "completion_ratio": completion_ratio,
             "avg_turnaround": float(np.mean(turnaround_vals)) if turnaround_vals else 0.0,
+            "avg_normalized_turnaround": float(np.mean(normalized_turnaround_vals)) if normalized_turnaround_vals else 0.0,
             "avg_response": float(np.mean(response_vals)) if response_vals else 0.0,
             "avg_waiting": float(np.mean(waiting_vals)) if waiting_vals else 0.0,
+            "avg_normalized_waiting": float(np.mean(normalized_waiting_vals)) if normalized_waiting_vals else 0.0,
             "total_context_switches": int(self.context_switches),
         }
 
@@ -526,7 +663,7 @@ class CPU:
         return merged.sort_values("combo_class").reset_index(drop=True)
 
 
-def load_processes(filename: str) -> List[Process]:
+def load_processes(filename: str, eval: bool = False) -> List[Process]:
     """
     Load processes from ../workloads relative to this script.
 
@@ -541,7 +678,35 @@ def load_processes(filename: str) -> List[Process]:
     The 'name' field is preserved from file.
     """
     file_path = Path(__file__).resolve().parent.parent / "workloads" / filename
+    eval_path = Path(__file__).resolve().parent.parent / filename
     processes = []
+
+    if eval:
+        with eval_path.open("r", encoding="cp1252") as f:
+            header_found = False
+
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                if line.startswith("#"):
+                    continue
+
+                if not header_found:
+                    if line.lower() == "name,arrival,burst":
+                        header_found = True
+                    continue
+
+                parts = line.split(",")
+                if len(parts) != 3:
+                    raise ValueError(f"Invalid row in {file_path}: {line}")
+
+                name, arrival, burst = map(int, parts)
+                processes.append(Process(name=name, arrival=arrival, burst=burst))
+
+        return processes
 
     with file_path.open("r", encoding="cp1252") as f:
         header_found = False
@@ -629,9 +794,9 @@ def generate_synthetic_workload(
 def generate_and_save_workloads(num_processes: int = 1000, force_regenerate: bool = False):
     """
     Ensure three workload files exist in ../workloads:
-      - short_10000_processes.txt
-      - long_10000_processes.txt
-      - mixed_10000_processes.txt
+      - short_processes.txt
+      - long_processes.txt
+      - mixed_processes.txt
 
     If a file already exists, it is reused.
     If it does not exist, it is generated once and saved.
@@ -641,9 +806,9 @@ def generate_and_save_workloads(num_processes: int = 1000, force_regenerate: boo
     data_dir.mkdir(parents=True, exist_ok=True)
 
     workload_specs = [
-        ("short_10000_processes.txt", "short"),
-        ("long_10000_processes.txt", "long"),
-        ("mixed_10000_processes.txt", "mixed"),
+        (f"short_{num_processes}_processes.txt", "short"),
+        (f"long_{num_processes}_processes.txt", "long"),
+        (f"mixed_{num_processes}_processes.txt", "mixed"),
     ]
 
     workload_files = []
@@ -813,6 +978,10 @@ def load_dataset_and_train_model(
             class_weight="balanced_subsample"
         )
 
+        nn_model = MLPClassifier(max_iter=500)
+
+        gb_model = GradientBoostingClassifier()
+
         pipe = Pipeline([
             ("preprocessor", preprocessor),
             ("random_forest", model)
@@ -907,6 +1076,9 @@ def evaluate_saved_model_on_workloads(
 
     Returns a dataframe with:
       - workload_file
+      - completed_processes
+      - total_processes
+      - completion_ratio
       - avg_turnaround
       - avg_response
       - avg_waiting
@@ -916,7 +1088,7 @@ def evaluate_saved_model_on_workloads(
 
     rows = []
     for workload_file in workload_files:
-        processes = load_processes(workload_file)
+        processes = load_processes(workload_file, True)
 
         cpu = CPU(
             processes=processes,
@@ -936,14 +1108,92 @@ def evaluate_saved_model_on_workloads(
 
     return pd.DataFrame(rows)
 
+
+def evaluate_static_assignments_on_workloads(
+    workload_files: List[str],
+    output_path: str = "scheduler_training_static_baselines.csv",
+    epoch: int = 25,
+    num_cores: int = 4,
+    verbose: bool = False,
+    force_regenerate: bool = False
+) -> pd.DataFrame:
+    """
+    Evaluate static core assignments on the training workloads and save results.
+
+    Static baselines:
+      - all SJF
+      - all FCFS
+      - all HRRN
+
+    For each workload/baseline pair, report:
+      - avg_turnaround
+      - avg_normalized_turnaround
+      - avg_waiting
+      - avg_normalized_waiting
+      - total_context_switches
+
+    This file is generated once unless force_regenerate=True.
+    """
+    output_file = Path(output_path)
+    if not force_regenerate and output_file.exists():
+        return pd.read_csv(output_file)
+
+    static_baselines = [
+        ("all_sjf", Algorithm.SJF),
+        ("all_fcfs", Algorithm.FCFS),
+        ("all_hrrn", Algorithm.HRRN),
+    ]
+
+    rows = []
+
+    for workload_file in workload_files:
+        original_processes = load_processes(workload_file)
+
+        for baseline_name, baseline_algorithm in static_baselines:
+            cpu = CPU(
+                processes=[p.clone_for_sim() for p in original_processes],
+                epoch=epoch,
+                num_cores=num_cores,
+                default_algorithm=baseline_algorithm,
+                verbose=verbose
+            )
+            cpu.cores = [Core(f"C{i}", algorithm=baseline_algorithm) for i in range(cpu.num_cores)]
+            cpu.init_queue()
+            cpu.update_done()
+
+            # Static assignment: run fixed algorithms for the whole workload.
+            while not cpu.all_finished():
+                cpu.step(sim=cpu.verbose)
+
+            summary = cpu.summary_metrics().copy()
+            summary["workload_file"] = workload_file
+            summary["baseline_name"] = baseline_name
+            summary["baseline_algorithm"] = baseline_algorithm.value
+            summary["final_system_time"] = cpu.system_time
+
+            rows.append(summary)
+
+            print(f"Completed static baseline: {baseline_name} on {workload_file}")
+            print(f"  Avg turnaround: {summary['avg_turnaround']:.4f}")
+            print(f"  Avg normalized turnaround: {summary['avg_normalized_turnaround']:.4f}")
+            print(f"  Avg waiting: {summary['avg_waiting']:.4f}")
+            print(f"  Avg normalized waiting: {summary['avg_normalized_waiting']:.4f}")
+            print(f"  Context switches: {summary['total_context_switches']}")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_path, index=False)
+    return df
+
 def ensure_simulation_outputs(
     workload_files: List[str],
     dataset_path: str = "scheduler_training_dataset.csv",
     mapping_path: str = "scheduler_class_mapping.csv",
     class_dist_path: str = "scheduler_class_distribution.csv",
+    summary_path: str = "scheduler_training_workload_summary.csv",
+    tie_log_path: str = "scheduler_training_tie_log.csv",
     epoch: int = 25,
     num_cores: int = 4,
-    default_algorithm: Algorithm = Algorithm.HRRN,
+    default_algorithm: Algorithm = Algorithm.SJF,
     verbose: bool = False,
     force_regenerate: bool = False
 ):
@@ -957,23 +1207,31 @@ def ensure_simulation_outputs(
     dataset_file = Path(dataset_path)
     mapping_file = Path(mapping_path)
     class_dist_file = Path(class_dist_path)
+    summary_file = Path(summary_path)
+    tie_log_file = Path(tie_log_path)
 
     if (
         not force_regenerate
         and dataset_file.exists()
         and mapping_file.exists()
         and class_dist_file.exists()
+        and summary_file.exists()
+        and tie_log_file.exists()
     ):
         return {
             "dataset_path": dataset_path,
             "mapping_path": mapping_path,
             "class_dist_path": class_dist_path,
+            "summary_path": summary_path,
+            "tie_log_path": tie_log_path,
             "generated": False
         }
 
     all_results = []
     class_mappings = []
     class_distributions = []
+    workload_summaries = []
+    tie_logs = []
 
     for workload_file in workload_files:
         cpu, df = run_workload_to_dataframe(
@@ -994,22 +1252,47 @@ def ensure_simulation_outputs(
         class_dist["workload_file"] = workload_file
         class_distributions.append(class_dist)
 
+        summary = cpu.summary_metrics().copy()
+        summary["workload_file"] = workload_file
+        summary["final_system_time"] = cpu.system_time
+        summary["training_rows_collected"] = len(df)
+        summary["tie_boundaries"] = cpu.tie_count
+        workload_summaries.append(summary)
+
+        tie_df = cpu.tie_dataframe().copy()
+        if not tie_df.empty:
+            tie_df["workload_file"] = workload_file
+            tie_logs.append(tie_df)
+
         print(f"Completed workload: {workload_file}")
         print(f"  Training rows collected: {len(df)}")
         print(f"  Final system time: {cpu.system_time}")
+        print(f"  Avg turnaround: {summary['avg_turnaround']:.4f}")
+        print(f"  Avg normalized turnaround: {summary['avg_normalized_turnaround']:.4f}")
+        print(f"  Avg waiting: {summary['avg_waiting']:.4f}")
+        print(f"  Avg normalized waiting: {summary['avg_normalized_waiting']:.4f}")
+        print(f"  Context switches: {summary['total_context_switches']}")
 
     combined_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
     combined_mapping_df = pd.concat(class_mappings, ignore_index=True) if class_mappings else pd.DataFrame()
     combined_class_dist_df = pd.concat(class_distributions, ignore_index=True) if class_distributions else pd.DataFrame()
+    workload_summary_df = pd.DataFrame(workload_summaries)
+    tie_log_df = pd.concat(tie_logs, ignore_index=True) if tie_logs else pd.DataFrame(
+        columns=["boundary_time", "epoch_end", "tie_count_at_boundary", "tied_combos", "selected_combo", "workload_file"]
+    )
 
     combined_df.to_csv(dataset_path, index=False)
     combined_mapping_df.to_csv(mapping_path, index=False)
     combined_class_dist_df.to_csv(class_dist_path, index=False)
+    workload_summary_df.to_csv(summary_path, index=False)
+    tie_log_df.to_csv(tie_log_path, index=False)
 
     return {
         "dataset_path": dataset_path,
         "mapping_path": mapping_path,
         "class_dist_path": class_dist_path,
+        "summary_path": summary_path,
+        "tie_log_path": tie_log_path,
         "generated": True
     }
 
@@ -1057,20 +1340,24 @@ if __name__ == "__main__":
 
     else:
         # Generate workloads only if they do not already exist
-        workload_files = generate_and_save_workloads(num_processes=10000, force_regenerate=False)
+        workload_files = generate_and_save_workloads(num_processes=1000, force_regenerate=False)
 
         dataset_path = "scheduler_training_dataset.csv"
         mapping_path = "scheduler_class_mapping.csv"
         class_dist_path = "scheduler_class_distribution.csv"
+        summary_path = "scheduler_training_workload_summary.csv"
+        tie_log_path = "scheduler_training_tie_log.csv"
 
         simulation_outputs = ensure_simulation_outputs(
             workload_files=workload_files,
             dataset_path=dataset_path,
             mapping_path=mapping_path,
             class_dist_path=class_dist_path,
+            summary_path=summary_path,
+            tie_log_path=tie_log_path,
             epoch=25,
             num_cores=4,
-            default_algorithm=Algorithm.HRRN,
+            default_algorithm=Algorithm.SJF,
             verbose=False,
             force_regenerate=False
         )
@@ -1079,10 +1366,24 @@ if __name__ == "__main__":
             print("\nSaved combined dataset to scheduler_training_dataset.csv")
             print("Saved combined class mapping to scheduler_class_mapping.csv")
             print("Saved combined class distribution to scheduler_class_distribution.csv")
+            print("Saved workload summary to scheduler_training_workload_summary.csv")
+            print("Saved tie log to scheduler_training_tie_log.csv")
         else:
             print("\nUsing existing scheduler_training_dataset.csv")
             print("Using existing scheduler_class_mapping.csv")
             print("Using existing scheduler_class_distribution.csv")
+            print("Using existing scheduler_training_workload_summary.csv")
+            print("Using existing scheduler_training_tie_log.csv")
+
+        static_baseline_df = evaluate_static_assignments_on_workloads(
+            workload_files=workload_files,
+            output_path="scheduler_training_static_baselines.csv",
+            epoch=25,
+            num_cores=4,
+            verbose=False,
+            force_regenerate=False
+        )
+        print("\nSaved or loaded static baseline comparison file: scheduler_training_static_baselines.csv")
 
         training_summary = load_dataset_and_train_model(
             dataset_path=dataset_path,
@@ -1133,9 +1434,9 @@ if __name__ == "__main__":
             print(result["classification_report"])
 
         original_eval_files = [
-            "workloads/short_10000_processes.txt",
-            "workloads/long_10000_processes.txt",
-            "workloads/mixed_10000_processes.txt",
+            "data/short_processes.txt",
+            "data/long_processes.txt",
+            "data/mixed_processes.txt",
         ]
 
         eval_df = evaluate_saved_model_on_workloads(
