@@ -9,11 +9,13 @@ from collections import deque
 from pathlib import Path
 from sklearn.compose import ColumnTransformer
 from imblearn.over_sampling import SMOTE
-from sklearn.pipeline import Pipeline
+from imblearn.combine import SMOTETomek
+from imblearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import make_scorer, f1_score, precision_score, recall_score, accuracy_score, classification_report
 import joblib
@@ -383,16 +385,14 @@ class CPU:
         # 1) Turnaround
         # 2) Waiting
         # 3) Fairness (max wait + variance)
-        # 4) Context switch overhead
         weighted_sum = (
             2.5 * turnaround +
             1.5 * waiting +
             1.0 * max_wait +
-            0.5 * variance +
-            0.25 * context
+            0.5 * variance
         )
 
-        total_weight = 2.5 + 1.5 + 1.0 + 0.5 + 0.25
+        total_weight = 2.5 + 1.5 + 1.0 + 0.5
         final_score = weighted_sum / total_weight
         return float(np.clip(final_score, 0.0, 1.0))
 
@@ -867,13 +867,9 @@ def load_dataset_and_train_model(
     """
     Load the saved dataframe and train one model per core algorithm target.
 
-    The existing dataset already supports this because it contains:
-      - core0_alg
-      - core1_alg
-      - core2_alg
-      - core3_alg
-
-    Rare labels are filtered per-core and reported.
+    Uses an imblearn Pipeline so SMOTE is applied only inside training folds
+    during cross-validation and only on the training partition during final fit.
+    This avoids data leakage.
     """
     df = pd.read_csv(dataset_path)
 
@@ -970,23 +966,6 @@ def load_dataset_and_train_model(
 
         preprocessor = build_preprocessor(X_train)
 
-        model = RandomForestClassifier(
-            random_state=42,
-            n_estimators=200,
-            max_depth=None,
-            min_samples_leaf=2,
-            class_weight="balanced_subsample"
-        )
-
-        nn_model = MLPClassifier(max_iter=500)
-
-        gb_model = GradientBoostingClassifier()
-
-        pipe = Pipeline([
-            ("preprocessor", preprocessor),
-            ("random_forest", model)
-        ])
-
         safe_splits = min(n_splits, smallest_class)
         if safe_splits < 2:
             per_core_results[target_col] = {
@@ -1000,6 +979,30 @@ def load_dataset_and_train_model(
             }
             continue
 
+        smote_k_neighbors = max(1, min(5, smallest_class - 1))
+
+        base_estimator = DecisionTreeClassifier(max_depth=2, class_weight="balanced", random_state=42)
+        try:
+            model = AdaBoostClassifier(
+                estimator=base_estimator,
+                n_estimators=150,
+                learning_rate=0.5,
+                random_state=42
+            )
+        except TypeError:
+            model = AdaBoostClassifier(
+                base_estimator=base_estimator,
+                n_estimators=150,
+                learning_rate=0.5,
+                random_state=42
+            )
+
+        pipe = Pipeline([
+            ("preprocessor", preprocessor),
+            ("smote", SMOTETomek(random_state=42)),
+            ("adaboost", model)
+        ])
+
         cv = StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
 
         cv_results = cross_validate(
@@ -1008,7 +1011,8 @@ def load_dataset_and_train_model(
             y,
             cv=cv,
             scoring=["f1_macro", "accuracy"],
-            return_train_score=False
+            return_train_score=False,
+            error_score="raise"
         )
 
         pipe.fit(X_train, y_train)
@@ -1017,6 +1021,8 @@ def load_dataset_and_train_model(
         trained_models[target_col] = pipe
         per_core_results[target_col] = {
             "trained": True,
+            "model_type": "AdaBoost + SMOTE",
+            "smote_k_neighbors": int(smote_k_neighbors),
             "accuracy": float(np.mean(cv_results["test_accuracy"])),
             "f1_score": float(np.mean(cv_results["test_f1_macro"])),
             "classification_report": classification_report(y_test, preds, zero_division=0),
@@ -1060,7 +1066,6 @@ def load_dataset_and_train_model(
         "rows": len(df),
         "model_path": model_output_path,
     }
-
 
 
 def evaluate_saved_model_on_workloads(
