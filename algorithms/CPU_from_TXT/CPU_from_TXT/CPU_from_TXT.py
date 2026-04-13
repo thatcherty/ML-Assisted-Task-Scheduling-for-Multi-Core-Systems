@@ -1,14 +1,13 @@
 """
 cpu_scheduler.py
-Loads long/short/mixed workload CSVs, runs SJF, SRT, HRRN on 4 cores,
+Loads long/short/mixed workload CSVs, runs SJF, FCFS, HRRN on 4 cores,
 and exports all results + summary to scheduler_results.xlsx
 
 Algorithm behaviour:
   SJF  – Non-preemptive Shortest Job First: picks the ready process with the
           shortest known burst and runs it to completion without interruption.
-  SRT  – Preemptive Shortest Remaining Time: at every scheduling event, the
-          running process on a core is preempted if a newly available process
-          has a shorter *remaining* burst.
+  FCFS – Non-preemptive First Come First Served: picks the ready process with
+          the earliest arrival time and runs it to completion without interruption.
   HRRN – Non-preemptive Highest Response Ratio Next: picks max (wait+burst)/burst.
 """
 
@@ -33,7 +32,7 @@ WORKLOAD_FILES = {
     "Short": "short_processes.txt",
     "Mixed": "mixed_processes.txt",
 }
-ALGORITHMS  = ["SJF", "SRT", "HRRN"]
+ALGORITHMS  = ["SJF", "FCFS", "HRRN"]
 OUTPUT_FILE = "scheduler_results.xlsx"
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -51,12 +50,10 @@ class Process:
     def turnaround(self): return self.finish_time - self.arrival
     @property
     def waiting(self):    return self.turnaround - self.burst
-    @property
-    def response(self):   return self.start_time - self.arrival
 
 class Algorithm(Enum):
     SJF  = "SJF"
-    SRT  = "SRT"
+    FCFS = "FCFS"
     HRRN = "HRRN"
 
 # ── CSV loader ─────────────────────────────────────────────────────────────────
@@ -73,14 +70,15 @@ def load_csv(filepath: str) -> List[Process]:
             ))
     return procs
 
-# ── Non-preemptive scheduler (SJF / HRRN) ─────────────────────────────────────
+# ── Non-preemptive scheduler (SJF / FCFS / HRRN) ──────────────────────────────
 
 def simulate_nonpreemptive(procs: List[Process], algo: Algorithm) -> List[Process]:
     """
-    Non-preemptive multi-core scheduler used by SJF and HRRN.
-    Once a process is assigned to a core it runs to completion.
+    Non-preemptive multi-core scheduler used by SJF, FCFS, and HRRN.
+    Once a process is assigned to a core it runs to completion without interruption.
     Selection policy differs per algorithm:
       SJF  – min burst (ties broken by arrival, then name)
+      FCFS – min arrival (ties broken by name)
       HRRN – max (wait + burst) / burst
     """
     remaining = [Process(p.name, p.arrival, p.burst) for p in procs]
@@ -110,6 +108,8 @@ def simulate_nonpreemptive(procs: List[Process], algo: Algorithm) -> List[Proces
 
             if algo == Algorithm.SJF:
                 chosen = min(available, key=lambda p: (p.burst, p.arrival, p.name))
+            elif algo == Algorithm.FCFS:
+                chosen = min(available, key=lambda p: (p.arrival, p.name))
             else:  # HRRN
                 chosen = max(available, key=lambda p: (
                     ((time - p.arrival) + p.burst) / p.burst, -p.arrival))
@@ -129,181 +129,10 @@ def simulate_nonpreemptive(procs: List[Process], algo: Algorithm) -> List[Proces
 
     return completed
 
-# ── Preemptive SRT scheduler ───────────────────────────────────────────────────
-
-@dataclass
-class _RTProc:
-    """Internal mutable process state used during SRT simulation."""
-    name: str
-    arrival: int
-    burst: int        # original burst (unchanged throughout)
-    remaining: int    # ticks of work still left
-    start_time: int = -1
-    finish_time: int = -1
-    core: int = -1
-
-def simulate_srt(procs: List[Process]) -> List[Process]:
-    """
-    Preemptive Shortest Remaining Time (SRT) on NUM_CORES cores.
-
-    At every scheduling event (process arrival OR process completion) we:
-      1. Move any newly arrived processes into the ready queue.
-      2. Fill idle cores with the shortest-remaining ready process.
-      3. Check whether any ready process has a shorter remaining burst than
-         the process currently running on a core — if so, preempt that core
-         and reassign.
-
-    Time jumps directly to the next event (no tick-by-tick loop).
-    """
-
-    rt_procs: List[_RTProc] = [
-        _RTProc(p.name, p.arrival, p.burst, p.burst) for p in procs
-    ]
-    rt_procs.sort(key=lambda p: (p.arrival, p.name))
-
-    # running[core] = (_RTProc, absolute_finish_time) or None
-    # Storing the absolute finish time avoids stale calculations after preemption.
-    # When a process is preempted we recompute how much it actually ran,
-    # deduct from remaining, then put it back in the ready queue.
-    running: List[Optional[tuple]] = [None] * NUM_CORES
-    ready: List[_RTProc] = []
-    not_arrived: List[_RTProc] = list(rt_procs)
-    completed_rt: List[_RTProc] = []
-    time = 0
-
-    def _next_event_time() -> int:
-        """Earliest future time at which something changes."""
-        candidates = []
-        for c in range(NUM_CORES):
-            if running[c] is not None:
-                _, finish_at = running[c]
-                candidates.append(finish_at)
-        for p in not_arrived:
-            candidates.append(p.arrival)
-        return min(candidates) if candidates else time
-
-    def _advance_to(new_time: int):
-        """
-        Move the clock to new_time.
-        Processes whose stored finish_at equals new_time are marked complete.
-        remaining is only updated on preemption, not here.
-        """
-        nonlocal time
-        for c in range(NUM_CORES):
-            if running[c] is not None:
-                proc, finish_at = running[c]
-                if finish_at == new_time:
-                    proc.remaining   = 0
-                    proc.finish_time = new_time
-                    proc.core        = c
-                    completed_rt.append(proc)
-                    running[c] = None
-        time = new_time
-
-    def _slice_start(c: int) -> int:
-        """Return the time the current slice on core c began."""
-        proc, finish_at = running[c]
-        return finish_at - proc.remaining
-
-    def _preempt_core(c: int):
-        """
-        Preempt the process on core c at the current time.
-        Deducts elapsed ticks from remaining and puts it back in the ready queue.
-        """
-        proc, finish_at = running[c]
-        elapsed         = time - _slice_start(c)
-        proc.remaining -= elapsed
-        ready.append(proc)
-        running[c] = None
-
-    def _assign(c: int, proc: _RTProc):
-        """Assign proc to core c starting at current time."""
-        if proc.start_time == -1:
-            proc.start_time = time
-        running[c] = (proc, time + proc.remaining)
-
-    def _schedule():
-        """
-        Assign processes to cores using SRT preemption logic:
-          Step 1 – admit newly arrived processes into the ready queue.
-          Step 2 – fill idle cores (shortest remaining first).
-          Step 3 – preempt the core with the longest remaining burst if a
-                   shorter ready process exists. Repeat until stable.
-        """
-        # Step 1 – admit arrivals
-        arrived = [p for p in not_arrived if p.arrival <= time]
-        for p in arrived:
-            ready.append(p)
-            not_arrived.remove(p)
-
-        ready.sort(key=lambda p: (p.remaining, p.arrival, p.name))
-
-        # Step 2 – fill idle cores
-        for c in range(NUM_CORES):
-            if running[c] is None and ready:
-                _assign(c, ready.pop(0))
-
-        # Step 3 – preemption loop
-        changed = True
-        while changed and ready:
-            changed = False
-            shortest_ready  = ready[0]
-            worst_core      = None
-            worst_remaining = shortest_ready.remaining  # only preempt if strictly shorter
-
-            for c in range(NUM_CORES):
-                if running[c] is not None:
-                    proc, _ = running[c]
-                    if proc.remaining > worst_remaining:
-                        worst_remaining = proc.remaining
-                        worst_core      = c
-
-            if worst_core is not None:
-                _preempt_core(worst_core)
-                ready.sort(key=lambda p: (p.remaining, p.arrival, p.name))
-                _assign(worst_core, ready.pop(0))
-                changed = True
-
-    # ── Main simulation loop ───────────────────────────────────────────────────
-    if not_arrived:
-        time = not_arrived[0].arrival
-
-    while not_arrived or ready or any(r is not None for r in running):
-        _schedule()
-        next_t = _next_event_time()
-        if next_t <= time:
-            break   # safety: no forward progress possible
-        _advance_to(next_t)
-
-    # Final drain — complete anything still running
-    _schedule()
-    for c in range(NUM_CORES):
-        if running[c] is not None:
-            proc, finish_at = running[c]
-            if proc.finish_time == -1:
-                proc.finish_time = finish_at
-                proc.core        = c
-                completed_rt.append(proc)
-            running[c] = None
-
-    # Convert _RTProc back to Process for compatibility with the rest of the pipeline
-    result: List[Process] = []
-    for rp in completed_rt:
-        p = Process(rp.name, rp.arrival, rp.burst)
-        p.start_time  = rp.start_time
-        p.finish_time = rp.finish_time
-        p.core        = rp.core
-        result.append(p)
-
-    return result
-
 # ── Unified dispatcher ─────────────────────────────────────────────────────────
 
 def simulate(procs: List[Process], algo: Algorithm) -> List[Process]:
-    if algo == Algorithm.SRT:
-        return simulate_srt(procs)
-    else:
-        return simulate_nonpreemptive(procs, algo)   # SJF and HRRN
+    return simulate_nonpreemptive(procs, algo)
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
@@ -336,7 +165,6 @@ def calc_metrics(procs: List[Process]) -> Dict:
     return {
         "avg_turnaround":         sum(p.turnaround for p in procs) / n,
         "avg_waiting":            sum(p.waiting    for p in procs) / n,
-        "avg_response":           sum(p.response   for p in procs) / n,
         "avg_context_switches":   switches / n,
         "total_context_switches": switches,
         "cpu_utilization_pct":    cpu_util,
@@ -404,8 +232,8 @@ def _dat(ws, row, col, val, ri=0, fmt=None, font=None):
 # ── Detail sheet (one per workload/algorithm combo) ────────────────────────────
 
 DCOLS   = ["Process","Arrival","Burst","Core","Start","Finish",
-           "Turnaround","Waiting","Response"]
-DWIDTHS = [10, 10, 8, 8, 8, 10, 14, 10, 12]
+           "Turnaround","Waiting"]
+DWIDTHS = [10, 10, 8, 8, 8, 10, 14, 10]
 
 def build_detail_sheet(wb, name, procs, metrics, workload, algo):
     ws  = wb.create_sheet(name)
@@ -419,7 +247,6 @@ def build_detail_sheet(wb, name, procs, metrics, workload, algo):
     band = [
         ("Avg Turnaround",        f"{metrics['avg_turnaround']:.2f}"),
         ("Avg Waiting",           f"{metrics['avg_waiting']:.2f}"),
-        ("Avg Response",          f"{metrics['avg_response']:.2f}"),
         ("Avg Ctx Switches/proc", f"{metrics['avg_context_switches']:.2f}"),
         ("CPU Utilization",       f"{metrics['cpu_utilization_pct']:.1f}%"),
         ("Throughput (p/tick)",   f"{metrics['throughput']:.5f}"),
@@ -465,7 +292,7 @@ def build_detail_sheet(wb, name, procs, metrics, workload, algo):
         r = first_data + ri
         for ci, val in enumerate(
             [f"P{p.name}", p.arrival, p.burst, f"Core {p.core}",
-             p.start_time, p.finish_time, p.turnaround, p.waiting, p.response], 1):
+             p.start_time, p.finish_time, p.turnaround, p.waiting], 1):
             _dat(ws, r, ci, val, ri=ri)
 
     last_data = first_data + n - 1
@@ -477,7 +304,7 @@ def build_detail_sheet(wb, name, procs, metrics, workload, algo):
             c = ws.cell(row=AR, column=ci, value="AVERAGE")
         elif ci in (5, 6):
             c = ws.cell(row=AR, column=ci, value="")
-        elif ci in (7, 8, 9):
+        elif ci in (7, 8):
             c = ws.cell(row=AR, column=ci,
                         value=f"=AVERAGE({col_l}{first_data}:{col_l}{last_data})")
             c.number_format = "0.00"
@@ -493,18 +320,18 @@ def build_detail_sheet(wb, name, procs, metrics, workload, algo):
 
 SCOLS = [
     "Workload","Algorithm","Processes","Makespan",
-    "Avg Turnaround","Avg Waiting","Avg Response",
+    "Avg Turnaround","Avg Waiting",
     "Avg Ctx Sw/Proc","Total Ctx Switches",
     "CPU Util %","Throughput (p/tick)","Avg Proc/Core",
     "C0 Procs","C1 Procs","C2 Procs","C3 Procs",
     "C0 Idle", "C1 Idle", "C2 Idle", "C3 Idle",
     "C0 Makespan","C1 Makespan","C2 Makespan","C3 Makespan",
 ]
-SWIDTHS = [12, 12, 12, 12, 17, 15, 15, 18, 20, 14, 22, 15,
+SWIDTHS = [12, 12, 12, 12, 17, 15, 18, 20, 14, 22, 15,
            10, 10, 10, 10,
            10, 10, 10, 10,
            13, 13, 13, 13]
-SFMTS   = [None,None,None,None,"0.00","0.00","0.00","0.00",None,"0.0","0.0000","0.00",
+SFMTS   = [None,None,None,None,"0.00","0.00","0.00",None,"0.0","0.0000","0.00",
            None,None,None,None,
            None,None,None,None,
            None,None,None,None]
@@ -516,7 +343,7 @@ def build_summary_sheet(wb, all_results):
     _title(ws, 1, f"CPU Scheduling — Full Summary  ({NUM_CORES} Cores)", NC, sz=13)
 
     for ci, lbl in enumerate(SCOLS, 1):
-        color = CORE_PURPLE if ci > 12 else DARK_BLUE
+        color = CORE_PURPLE if ci > 11 else DARK_BLUE
         _hdr(ws, 2, ci, lbl, color=color)
     ws.row_dimensions[2].height = 18
 
@@ -524,7 +351,7 @@ def build_summary_sheet(wb, all_results):
         r = 3 + ri
         row_data = [
             wl, algo, m["n"], m["makespan"],
-            m["avg_turnaround"], m["avg_waiting"], m["avg_response"],
+            m["avg_turnaround"], m["avg_waiting"],
             m["avg_context_switches"], m["total_context_switches"],
             m["cpu_utilization_pct"], m["throughput"],
             m["avg_processes_per_core"],
@@ -533,7 +360,7 @@ def build_summary_sheet(wb, all_results):
             *m["core_makespan"],
         ]
         for ci, (val, fmt) in enumerate(zip(row_data, SFMTS), 1):
-            font = _pf() if ci > 12 else None
+            font = _pf() if ci > 11 else None
             _dat(ws, r, ci, val, ri=ri, fmt=fmt, font=font)
 
     last_data = 2 + len(all_results)
@@ -542,7 +369,7 @@ def build_summary_sheet(wb, all_results):
     _title(ws, sep, "Per-Workload Averages  (across all 3 algorithms)", NC,
            color=MID_BLUE, sz=11)
     for ci, lbl in enumerate(SCOLS, 1):
-        color = CORE_PURPLE if ci > 12 else TEAL
+        color = CORE_PURPLE if ci > 11 else TEAL
         _hdr(ws, sep + 1, ci, lbl, color=color)
 
     workloads = list(dict.fromkeys(r[0] for r in all_results))
@@ -559,7 +386,7 @@ def build_summary_sheet(wb, all_results):
             col_l = get_column_letter(ci)
             refs  = ",".join(f"{col_l}{er}" for er in excel_rows)
             c = ws.cell(row=r, column=ci, value=f"=AVERAGE({refs})")
-            font = _pf() if ci > 12 else _gf()
+            font = _pf() if ci > 11 else _gf()
             _s(c, font=font, fill=_fill(AVG_GREEN))
             fmt = SFMTS[ci - 1]
             if fmt: c.number_format = fmt
@@ -593,7 +420,6 @@ def main():
 
             print(f"  {algo_name}  TA={metrics['avg_turnaround']:8.2f}  "
                   f"WT={metrics['avg_waiting']:8.2f}  "
-                  f"RT={metrics['avg_response']:8.2f}  "
                   f"CS/p={metrics['avg_context_switches']:5.2f}  "
                   f"CPU={metrics['cpu_utilization_pct']:5.1f}%  "
                   f"P/Core={metrics['avg_processes_per_core']:.2f}  "
